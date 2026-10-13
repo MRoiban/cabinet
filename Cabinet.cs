@@ -927,6 +927,79 @@ namespace Cabinet
             return true;
         }
 
+        // Raw value edits retain every unrelated byte, including comments and whitespace.
+        public string RawValue(params string[] path)
+        {
+            ValidateControllerText();
+            int parent = path.Length == 1 ? -1 : Block(path.Take(path.Length - 1).ToArray());
+            if (path.Length > 1 && parent < 0) return null;
+            int key = Child(parent, path[path.Length - 1]);
+            if (key < 0) return null;
+            int end = toks[key + 1].Kind == '{' ? Match(key + 1) : key + 1;
+            return Text.Substring(toks[key + 1].Start, toks[end].End - toks[key + 1].Start);
+        }
+
+        public string StringValue(params string[] path)
+        {
+            string raw = RawValue(path);
+            if (raw == null || !raw.StartsWith("\"")) return null;
+            var value = new VdfText("\"value\" " + raw);
+            return value.toks[1].Text;
+        }
+
+        public void SetRawValue(string raw, params string[] path)
+        {
+            ValidateControllerText();
+            if (raw != null) new VdfText("\"value\" " + raw).ValidateControllerText();
+            int parent = -1;
+            for (int n = 0; n < path.Length - 1; n++)
+            {
+                int key = Child(parent, path[n]);
+                if (key < 0)
+                {
+                    if (raw == null) return;
+                    if (parent < 0) throw new InvalidDataException("Missing VDF root");
+                    Text = Text.Insert(toks[Match(parent)].Start, "\n\"" + path[n] + "\" { }\n");
+                    Tokenize(); key = Child(parent, path[n]);
+                }
+                if (toks[key + 1].Kind != '{') throw new InvalidDataException("VDF path is not a block");
+                parent = key + 1;
+            }
+            int k = Child(parent, path[path.Length - 1]);
+            if (k >= 0)
+            {
+                int end = toks[k + 1].Kind == '{' ? Match(k + 1) : k + 1;
+                int start = raw == null ? toks[k].Start : toks[k + 1].Start;
+                Text = Text.Remove(start, toks[end].End - start);
+                if (raw != null) Text = Text.Insert(start, raw);
+            }
+            else if (raw != null)
+            {
+                if (parent < 0) throw new InvalidDataException("Missing VDF root");
+                Text = Text.Insert(toks[Match(parent)].Start, "\n\"" + path[path.Length - 1] + "\" " + raw + "\n");
+            }
+            Tokenize(); ValidateControllerText();
+        }
+
+        public void ValidateControllerText()
+        {
+            int depth = 0;
+            for (int i = 0; i < toks.Count; i++)
+            {
+                var t = toks[i];
+                if (t.End > Text.Length) throw new InvalidDataException("Truncated VDF string");
+                if (t.Kind == '{') depth++;
+                if (t.Kind == '}' && --depth < 0) throw new InvalidDataException("Unbalanced VDF");
+                if (t.Kind == 's')
+                {
+                    if (++i >= toks.Count || (toks[i].Kind != 's' && toks[i].Kind != '{')) throw new InvalidDataException("Missing VDF value");
+                    if (toks[i].End > Text.Length) throw new InvalidDataException("Truncated VDF value");
+                    if (toks[i].Kind == '{') depth++;
+                }
+            }
+            if (depth != 0) throw new InvalidDataException("Unbalanced VDF");
+        }
+
         int LineStart(int pos)
         {
             while (pos > 0 && Text[pos - 1] != '\n') pos--;
@@ -1412,6 +1485,27 @@ namespace Cabinet
 
         public IEnumerable<string> GameDirs() { return gameDirs.Select(g => g.Value + "  " + g.Key); }
 
+        // Process start times disambiguate launches seen in the same five-second tick.
+        public string LatestRunningApp(HashSet<string> running)
+        {
+            if (running.Count == 0) return null;
+            string latest = null; DateTime start = DateTime.MinValue;
+            foreach (var p in Process.GetProcesses()) using (p)
+            {
+                try
+                {
+                    string image = ImagePath(p);
+                    if (image == null) continue;
+                    foreach (var game in gameDirs)
+                        if (running.Contains(game.Value) && image.StartsWith(game.Key, StringComparison.OrdinalIgnoreCase) && p.StartTime.ToUniversalTime() > start)
+                        { latest = game.Value; start = p.StartTime.ToUniversalTime(); }
+                }
+                catch (InvalidOperationException) { }
+                catch (System.ComponentModel.Win32Exception) { }
+            }
+            return latest;
+        }
+
         public HashSet<string> RunningApps()
         {
             var res = new HashSet<string>();
@@ -1742,6 +1836,7 @@ namespace Cabinet
         readonly Shadows shadows;
         readonly SchemaFill schemas;
         readonly SessionMedia media;
+        readonly ControllerLayouts controllers;
         readonly Dictionary<string, string> syncTimes = new Dictionary<string, string>();
         DateTime nextUpdate = DateTime.UtcNow.AddMinutes(1);
         bool checkingUpdate, manualUpdate;
@@ -1761,6 +1856,7 @@ namespace Cabinet
             shadows = new Shadows(Log);
             schemas = new SchemaFill(Log);
             media = new SessionMedia(Log);
+            controllers = new ControllerLayouts(Log);
             CloudSync.Configure(Log, playtime.QueueCloudMinutes, playtime.CloudMinutesInSteam, delegate { return playtime.RunningApps(); });
             WorkshopLinker.Initialize(Log);
             using (var stream = typeof(App).Assembly.GetManifestResourceStream("Cabinet.Icon"))
@@ -1800,6 +1896,12 @@ namespace Cabinet
                 var account = Syncer.AccountId();
                 var msg = playtime.Tick(account);
                 var running = playtime.RunningApps();
+                try
+                {
+                    var controllerMsg = controllers.Tick(running, account, playtime.LatestRunningApp(running));
+                    if (controllerMsg != null) QueueBalloon(controllerMsg);
+                }
+                catch (Exception ex) { Log("controller error: " + ex.Message); }
                 var workshopMsg = WorkshopLinker.Tick(running);
                 if (workshopMsg != null) QueueBalloon(workshopMsg);
                 try { media.Tick(running, account); }
@@ -2320,6 +2422,25 @@ namespace Cabinet
         [STAThread]
         static void Main(string[] args)
         {
+            if (args.Length > 0 && args[0].StartsWith("--controller-", StringComparison.Ordinal))
+            {
+                try
+                {
+                    Directory.CreateDirectory(DataDir);
+                    var controller = new ControllerLayouts(delegate(string line) { Log(line); Console.WriteLine(line); });
+                    if (args.Length == 1 && args[0] == "--controller-restore")
+                    {
+                        var detector = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log); detector.RefreshGames();
+                        if (detector.RunningApps().Count > 0 || Shadows.AnyHelper()) throw new InvalidOperationException(L.T("Stop the OnlineFix game before restoring controllers.", "Fermez le jeu OnlineFix avant de restaurer les manettes."));
+                        controller.Restore();
+                        Console.WriteLine(L.T("Original Spacewar controller configuration restored.", "Configuration manette Spacewar originale restaur?e."));
+                    }
+                    else if (args.Length == 2 && args[0] == "--controller-apply") controller.Apply(args[1], Syncer.AccountId());
+                    else throw new ArgumentException(L.T("Use --controller-apply <appid> or --controller-restore.", "Utilisez --controller-apply <appid> ou --controller-restore."));
+                }
+                catch (Exception ex) { Log("controller CLI: " + ex.Message); Console.WriteLine(ex.Message); Environment.ExitCode = 1; }
+                return;
+            }
             if (CloudSync.HandleArgs(args)) return;
             if (args.Length > 0 && args[0] == "--workshop") { WorkshopLinker.RunCli(args); return; }
             if (args.Length == 4 && args[0] == "--join-probe")
