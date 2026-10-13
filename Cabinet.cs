@@ -1210,7 +1210,8 @@ namespace Cabinet
 
         sealed class GameOverview
         {
-            public string Id, Name, Detail, Tip;
+            public string Id, Name, Detail, Tip, Played;
+            public int Unlocked, Total;
             public string Text { get { return Detail.Length == 0 ? Name : Name + " — " + Detail; } }
             public long Recent;
         }
@@ -1267,9 +1268,11 @@ namespace Cabinet
                 // Skip games with nothing to show, and unnamed ones (uninstalled, no achievement list).
                 if ((total == 0 && minutes == 0) || name == id) continue;
                 var parts = new List<string>();
+                string playedText = minutes == 0 ? "" : minutes < 60 ? minutes + " min" : (minutes / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + " h";
                 if (total > 0) parts.Add(unlocked + " / " + total + " achievements");
-                if (minutes > 0) parts.Add(minutes < 60 ? minutes + " min" : (minutes / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + " h");
+                if (minutes > 0) parts.Add(playedText);
                 result.Add(new GameOverview { Id = id, Name = name, Detail = string.Join("   ·   ", parts.ToArray()),
+                    Unlocked = unlocked, Total = total, Played = playedText,
                     Recent = Math.Max(played, date == DateTime.MinValue ? 0 : Playtime.Unix(date)),
                     Tip = "Last synced " + (date == DateTime.MinValue ? "never" : date.ToLocalTime().ToString("g")) + "\nClick to open in Steam" });
             }
@@ -1282,18 +1285,77 @@ namespace Cabinet
             menu.DropDownItems.Clear();
             try
             {
-                foreach (var game in Games(syncTimes))
+                var games = Games(syncTimes);
+                if (games.Count > 0) menu.DropDownItems.Add(new GameMenuItem(null));
+                foreach (var game in games)
                 {
                     string id = game.Id;
-                    // Detail goes in the right-aligned shortcut column so the numbers line up.
-                    var item = new ToolStripMenuItem(game.Name.Replace("&", "&&"), null, delegate { Process.Start("steam://nav/games/details/" + id); });
-                    item.ShortcutKeyDisplayString = game.Detail;
+                    var item = new GameMenuItem(game);
+                    item.Click += delegate { Process.Start("steam://nav/games/details/" + id); };
                     item.ToolTipText = game.Tip;
                     menu.DropDownItems.Add(item);
                 }
+                GameMenuItem.Measure(menu.DropDownItems.OfType<GameMenuItem>().ToList());
                 if (menu.DropDownItems.Count == 0) menu.DropDownItems.Add(new ToolStripMenuItem("No tracked games yet") { Enabled = false });
             }
             catch (Exception ex) { Log("overview failed: " + ex.Message); }
+        }
+
+        // Games submenu row drawn as columns: name | unlocked / total | played. A null game makes the header row.
+        sealed class GameMenuItem : ToolStripMenuItem
+        {
+            const int Gap = 28, Right = 22;
+            static int wUnlocked, wTotal, wPlayed;
+            readonly string unlocked, total, played;
+            readonly bool header;
+
+            public GameMenuItem(GameOverview g)
+            {
+                header = g == null;
+                if (header) { Text = "Game"; unlocked = ""; total = "Achievements"; played = "Played"; Enabled = false; return; }
+                Text = g.Name.Replace("&", "&&");
+                unlocked = g.Total > 0 ? g.Unlocked.ToString() : "";
+                total = g.Total > 0 ? "/ " + g.Total : "";
+                played = g.Played;
+            }
+
+            public static void Measure(List<GameMenuItem> items)
+            {
+                wUnlocked = wTotal = wPlayed = 0;
+                foreach (var i in items)
+                {
+                    wUnlocked = Math.Max(wUnlocked, TextRenderer.MeasureText(i.unlocked, i.Font, Size.Empty, TextFormatFlags.NoPadding).Width);
+                    wPlayed = Math.Max(wPlayed, TextRenderer.MeasureText(i.played, i.Font).Width);
+                    if (!i.header) wTotal = Math.Max(wTotal, TextRenderer.MeasureText(i.total, i.Font, Size.Empty, TextFormatFlags.NoPadding).Width);
+                }
+                // The header label spans both achievement columns.
+                var h = items.FirstOrDefault(i => i.header);
+                if (h != null) wTotal = Math.Max(wTotal, TextRenderer.MeasureText(h.total, h.Font).Width - wUnlocked);
+
+                // The dropdown sizes itself from text + shortcut column only, so reserve the columns' width
+                // with invisible figure spaces in the shortcut column and paint over that area.
+                if (items.Count == 0) return;
+                int need = wUnlocked + 3 + wTotal + Gap + wPlayed, n = 1;
+                var font = items[0].Font;
+                while (TextRenderer.MeasureText(new string('\u2007', n), font).Width < need) n++;
+                foreach (var i in items) i.ShortcutKeyDisplayString = new string('\u2007', n);
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                var color = header ? SystemColors.GrayText : ForeColor;
+                var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+                int h = Height, xPlayed = Width - Right - wPlayed, xTotal = xPlayed - Gap - wTotal, xUnlocked = xTotal - wUnlocked;
+                TextRenderer.DrawText(e.Graphics, played, Font, new Rectangle(xPlayed, 0, wPlayed, h), color, flags | TextFormatFlags.Right);
+                if (header)
+                    TextRenderer.DrawText(e.Graphics, total, Font, new Rectangle(xUnlocked, 0, wUnlocked + wTotal, h), color, flags | TextFormatFlags.HorizontalCenter);
+                else
+                {
+                    TextRenderer.DrawText(e.Graphics, unlocked, Font, new Rectangle(xUnlocked, 0, wUnlocked, h), color, flags | TextFormatFlags.Right | TextFormatFlags.NoPadding);
+                    TextRenderer.DrawText(e.Graphics, total, Font, new Rectangle(xTotal + 3, 0, wTotal, h), color, flags | TextFormatFlags.Left | TextFormatFlags.NoPadding);
+                }
+            }
         }
 
         static Version NumericVersion(string text)
@@ -1581,6 +1643,19 @@ namespace Cabinet
             {
                 var r = Syncer.Sync(args[1], Syncer.AccountId());
                 Console.WriteLine(r.GameName + ": +" + r.NewAchievements + " achievements, " + r.StatsChanged + " stats" + (r.Skipped != null ? " (skipped: " + r.Skipped + ")" : ""));
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--menu-preview")   // console/debug: render the Games submenu to a PNG
+            {
+                Application.EnableVisualStyles();
+                var dd = new ToolStripDropDownMenu();
+                var games = Games(new Dictionary<string, string>());
+                if (games.Count > 0) dd.Items.Add(new GameMenuItem(null));
+                foreach (var g in games) dd.Items.Add(new GameMenuItem(g));
+                GameMenuItem.Measure(dd.Items.OfType<GameMenuItem>().ToList());
+                dd.Show(new Point(-5000, -5000));
+                using (var bmp = new Bitmap(dd.Width, dd.Height)) { dd.DrawToBitmap(bmp, new Rectangle(Point.Empty, dd.Size)); bmp.Save(args[1]); }
+                dd.Close();
                 return;
             }
             if (args.Length == 2 && args[0] == "--dump")   // console/debug: print a binary KV file
