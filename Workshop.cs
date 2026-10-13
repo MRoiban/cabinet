@@ -15,7 +15,8 @@
 // [Interfaces] UGC=true. We use the directory containing OnlineFix(64).dll
 // (also the inner executable directory for Unreal games); INI files stay intact.
 // https://online-fix.me/guides/17021-kak-ustanovit-mody-iz-masterskoy-steam-how-to-install-steam-workshop-mods.html
-// Generic links need no profile. STS2 additionally uses its native mods loader.
+// Generic links need no profile. Profiled games (STS2) use only their native mods
+// loader: with both, STS2 crashed at startup inside OnlineFix's UGC emulation.
 // This component does not download subscriptions or enable mods in-game.
 // Ownership journal: DataDir/workshop-links.json. Existing links are never
 // adopted, replaced or deleted. Only owned matching NTFS junctions whose target
@@ -62,6 +63,7 @@ namespace Cabinet
                 {
                     if (engine == null) Initialize(logger);
                     DateTime now = DateTime.UtcNow;
+                    TrackSessions(runningAppIds, now);
                     FetchProfiles(now);
                     if (now < nextScan && (VolatileReadDirty() == 0 || now < nextScan.AddSeconds(-50))) return null;
                     var libs = Playtime.Libraries().Select(WorkshopEngine.Full).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -72,6 +74,29 @@ namespace Cabinet
                     return engine.Scan(libs, runningAppIds, false);
                 }
                 catch (Exception ex) { logger(L.T("Workshop scan failed: ", "Échec de l'analyse du Workshop : ") + ex.Message); nextScan = DateTime.UtcNow.AddSeconds(60); return null; }
+            }
+        }
+
+        // A Workshop link that makes the game close within a minute, twice in a row,
+        // is treated as incompatible: the next scan removes it and never recreates it.
+        static readonly Dictionary<string, DateTime> sessionStart = new Dictionary<string, DateTime>();
+        static readonly Dictionary<string, int> quickExits = new Dictionary<string, int>();
+        static void TrackSessions(ICollection<string> running, DateTime now)
+        {
+            if (running == null) return;
+            foreach (string id in running) if (!sessionStart.ContainsKey(id)) sessionStart[id] = now;
+            foreach (string id in sessionStart.Keys.Where(k => !running.Contains(k)).ToArray())
+            {
+                TimeSpan length = now - sessionStart[id];
+                sessionStart.Remove(id);
+                if (!engine.HasRootLink(id)) continue;
+                int count;
+                quickExits.TryGetValue(id, out count);
+                quickExits[id] = count = length < TimeSpan.FromSeconds(60) ? count + 1 : 0;
+                if (count < 2) continue;
+                logger(L.T("Workshop link disabled for app ", "Lien Workshop désactivé pour l'app ") + id + L.T(": the game closed right after launch twice.", " : le jeu s'est fermé juste après le lancement deux fois."));
+                engine.Disable(id);
+                Interlocked.Exchange(ref dirty, 1); nextScan = now;
             }
         }
 
@@ -167,8 +192,10 @@ namespace Cabinet
             public string Destination { get; set; }
             public string Target { get; set; }
         }
-        readonly string dataDir, journal;
+        readonly string dataDir, journal, disabledFile;
         readonly Action<string> log;
+        // Apps whose OnlineFix Workshop link made the game close right after launch.
+        readonly HashSet<string> disabled = new HashSet<string>();
         // Static: engines are recreated per scan, and status lines should appear once per session, not every scan.
         static readonly HashSet<string> reported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, Profile> profiles;
@@ -178,6 +205,9 @@ namespace Cabinet
         internal WorkshopEngine(string data, Action<string> logger)
         {
             dataDir = Full(data); journal = Path.Combine(dataDir, "workshop-links.json"); log = logger;
+            disabledFile = Path.Combine(dataDir, "workshop-disabled.txt");
+            try { if (File.Exists(disabledFile)) foreach (string line in File.ReadAllLines(disabledFile)) if (Numeric(line.Trim())) disabled.Add(line.Trim()); }
+            catch (IOException) { }
             LoadOwned();
             LoadProfiles();
         }
@@ -369,13 +399,19 @@ namespace Cabinet
                             string fixDir = Path.GetDirectoryName(ini);
                             if (!InterfaceEnabled(text, "UGC"))
                                 Once(ini + "ugc", L.T("OnlineFix Workshop requires [Interfaces] UGC=true; INI left unchanged: ", "Le Workshop OnlineFix nécessite [Interfaces] UGC=true ; INI laissé intact : ") + ini);
-                            SyncFolder(game, id, fake, title, Path.Combine(fixDir, "Workshop"), roots, running, readOnly, true, ref created, ref removed, names);
-                            if (profile != null)
-                            {
-                                string mods = Full(Path.Combine(game, profile.modFolder));
-                                if (Inside(mods, game) && !Same(mods, Path.Combine(fixDir, "Workshop")))
-                                    SyncFolder(game, id, fake, title, mods, roots, running, readOnly, false, ref created, ref removed, names);
-                            }
+                            string fixWorkshop = Path.Combine(fixDir, "Workshop");
+                            string mods = profile == null ? null : Full(Path.Combine(game, profile.modFolder));
+                            bool nativeLoader = mods != null && Inside(mods, game) && !Same(mods, fixWorkshop);
+                            // A game's own loader is proven; OnlineFix's UGC emulation crashed STS2 at
+                            // startup whenever the Workshop folder was also present.
+                            if (nativeLoader)
+                                DropRootLink(game, id, fake, title, fixWorkshop, running, readOnly, L.T("Removed OnlineFix Workshop link; the game loads mods from its own folder: ", "Lien Workshop OnlineFix supprimé ; le jeu charge les mods depuis son propre dossier : "), ref removed, names);
+                            else if (disabled.Contains(id))
+                                DropRootLink(game, id, fake, title, fixWorkshop, running, readOnly, L.T("Removed OnlineFix Workshop link; the game kept closing right after launch with it: ", "Lien Workshop OnlineFix supprimé ; le jeu se fermait juste après le lancement avec ce lien : "), ref removed, names);
+                            else
+                                SyncFolder(game, id, fake, title, fixWorkshop, roots, running, readOnly, true, ref created, ref removed, names);
+                            if (nativeLoader)
+                                SyncFolder(game, id, fake, title, mods, roots, running, readOnly, false, ref created, ref removed, names);
                         }
                     }
                     catch (Exception ex) { Once(game + "error", L.T("Workshop game scan failed: ", "Échec de l'analyse Workshop du jeu : ") + game + " - " + ex.Message); }
@@ -394,6 +430,26 @@ namespace Cabinet
                 if (active.Equals("Interfaces", StringComparison.OrdinalIgnoreCase) && Regex.IsMatch(line, "^" + Regex.Escape(key) + @"\s*=\s*true\s*(?:[;#].*)?$", RegexOptions.IgnoreCase)) return true;
             }
             return false;
+        }
+        void DropRootLink(string game, string id, string fake, string title, string folder, ICollection<string> running, bool readOnly, string reason, ref int removed, HashSet<string> names)
+        {
+            var link = owned.FirstOrDefault(x => x.Created && x.AppId == id && Same(x.Game, game) && Same(x.Destination, folder));
+            if (link == null) return;
+            string current = WorkshopJunction.Target(folder);
+            if (current == null || !Same(current, link.Target)) return;
+            if (readOnly) { log(L.T("Would remove Workshop folder link: ", "Suppression prévue du lien du dossier Workshop : ") + folder); return; }
+            if (!stateValid || Running(game, id, fake, running)) return;
+            if (WorkshopJunction.Remove(folder, link.Target))
+            { owned.Remove(link); Save(); removed++; names.Add(title); log(reason + folder); }
+        }
+        internal bool HasRootLink(string id)
+        {
+            return owned.Any(x => x.Created && x.AppId == id && Path.GetFileName(x.Destination).Equals("Workshop", StringComparison.OrdinalIgnoreCase));
+        }
+        internal void Disable(string id)
+        {
+            if (!disabled.Add(id)) return;
+            AtomicWrite(disabledFile, string.Join("\r\n", disabled.ToArray()));
         }
         void CreateOwned(string game, string id, string destination, string target)
         {
