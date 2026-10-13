@@ -103,7 +103,7 @@ namespace Cabinet
                         catch (Exception ex) { Once(log, "presence publish failed", ex); }
                     }
                     if (!Playtime.SteamRunning()) { installed = false; return; }
-                    var labels = new Dictionary<string, string>();
+                    var labels = new Dictionary<string, Label>();
                     if (connected)
                     {
                         try { labels = ReadPlayers(request("GET", "/api/presence", null), own); }
@@ -119,33 +119,56 @@ namespace Cabinet
                 finally { busy = false; }
             });
         }
-        internal static Dictionary<string, string> ReadPlayers(object response, uint own)
+        internal static Dictionary<string, Label> ReadPlayers(object response, uint own)
         {
-            var result = new Dictionary<string, string>(); object players;
+            var result = new Dictionary<string, Label>(); object players;
             if (!CloudClient.Map(response).TryGetValue("players", out players)) return result;
             var list = players as IEnumerable; if (list == null) return result;
             foreach (object entry in list)
             {
-                var row = CloudClient.Map(entry); object account, name, updated;
+                var row = CloudClient.Map(entry); object account, name, updated, app;
                 uint id; long time;
                 if (!row.TryGetValue("accountId", out account) || !uint.TryParse(Convert.ToString(account, CultureInfo.InvariantCulture), out id) || id == 0 || id == own) continue;
                 if (!row.TryGetValue("updatedAt", out updated) || !long.TryParse(Convert.ToString(updated, CultureInfo.InvariantCulture), out time) || time < CloudClient.Now() - 180000) continue;
-                if (!row.TryGetValue("name", out name)) continue;
-                string label = CleanName(name as string); if (label.Length != 0) result[id.ToString(CultureInfo.InvariantCulture)] = label;
+                if (!row.TryGetValue("name", out name) || !row.TryGetValue("appId", out app)) continue;
+                string label = CleanName(name as string), appId = app as string;
+                if (label.Length != 0 && appId != null && Regex.IsMatch(appId, @"^[1-9][0-9]{0,9}\z"))
+                    result[id.ToString(CultureInfo.InvariantCulture)] = new Label { name = label, app = appId };
             }
             return result;
         }
-        internal static string BuildScript(Dictionary<string, string> labels)
+        internal sealed class Label { public string name { get; set; } public string app { get; set; } }
+        internal static string BuildScript(Dictionary<string, Label> labels)
         {
-            // Only serialized data enters the script. App 480 and its join metadata stay intact.
+            // Only serialized data enters the script. App 480, the lobby and the connect
+            // string stay intact so Join Game still works. The game id is what Launch Game
+            // runs, so it points at the real game; the icon comes from the real game too.
             return @"(function(labels){
 var store=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
 if(!store)throw new Error('Cabinet: friends store unavailable');
 var s=window.__cabinetLabels;
+if(s&&s.version!==2){
+ s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);
+ s.patches.forEach(function(v,p){if(p.UpdateFromMessage===v.wrapped)p.UpdateFromMessage=v.original;});
+ s=null;
+}
 if(!s){
- s=window.__cabinetLabels={labels:{},written:new Map(),patches:new Map(),expires:0};
- s.clear=function(p){var v=s.written.get(p);if(v){if(p.m_strGameExtraInfo===v.value)p.m_strGameExtraInfo=v.before;s.written.delete(p);}};
- s.one=function(p,id){var name=s.labels[String(id)];if(p.m_unGamePlayedAppID===480&&name){var v=s.written.get(p);if(!v||p.m_strGameExtraInfo!==v.value){s.written.set(p,{before:p.m_strGameExtraInfo,value:name});}else{v.value=name;}p.m_strGameExtraInfo=name;}else{s.clear(p);}};
+ s=window.__cabinetLabels={version:2,labels:{},written:new Map(),patches:new Map(),expires:0};
+ s.clear=function(p){var v=s.written.get(p);if(!v)return;
+  if(p.m_strGameExtraInfo===v.name)p.m_strGameExtraInfo=v.beforeName;
+  if(p.m_gameid===v.app)p.m_gameid=v.beforeGame;
+  s.written.delete(p);};
+ s.one=function(p,id){var l=s.labels[String(id)];
+  if(p.m_unGamePlayedAppID!==480||!l){s.clear(p);return;}
+  var v=s.written.get(p);
+  if(!v||p.m_strGameExtraInfo!==v.name||p.m_gameid!==v.app){v={beforeName:p.m_strGameExtraInfo,beforeGame:p.m_gameid};s.written.set(p,v);}
+  v.name=l.name;v.app=l.app;p.m_strGameExtraInfo=l.name;p.m_gameid=l.app;};
+ s.icon=function(p){var v=s.written.get(p),apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore;
+  if(!v||p.m_gameid!==v.app||!apps)return null;
+  var info=apps.GetAppInfo(Number(v.app));return info&&info.icon_url?info.icon_url:null;};
+ s.patch=function(proto,name,make){var m=s.patches.get(proto);if(!m){m={};s.patches.set(proto,m);}
+  if(m[name]||typeof proto[name]!=='function')return;
+  var original=proto[name],wrapped=make(original);m[name]={original:original,wrapped:wrapped};proto[name]=wrapped;};
  s.apply=function(){
   if(Date.now()>s.expires)s.labels={};
   var current=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;if(!current)return;
@@ -154,10 +177,9 @@ if(!s){
   s.written.forEach(function(v,p){if(!ids.has(p))s.clear(p);});
   friends.forEach(function(f){var p=f.persona;if(!p)return;
    var proto=Object.getPrototypeOf(p);
-   if(proto&&typeof proto.UpdateFromMessage==='function'&&!s.patches.has(proto)){
-    var original=proto.UpdateFromMessage;
-    var wrapped=function(){s.clear(this);var r=original.apply(this,arguments);s.apply();return r;};
-    s.patches.set(proto,{original:original,wrapped:wrapped});proto.UpdateFromMessage=wrapped;
+   if(proto){
+    s.patch(proto,'UpdateFromMessage',function(o){return function(){s.clear(this);var r=o.apply(this,arguments);s.apply();return r;};});
+    s.patch(proto,'GetCurrentGameIconURL',function(o){return function(){return s.icon(this)||o.apply(this,arguments);};});
    }
    s.one(p,f.accountid);
   });
@@ -179,7 +201,7 @@ s.labels=labels;s.expires=Date.now()+180000;s.apply();return true;
             }
             return null;
         }
-        internal static void Apply(Dictionary<string, string> labels)
+        internal static void Apply(Dictionary<string, Label> labels)
         {
             var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:8080/json");
             req.Timeout = 3000; req.ReadWriteTimeout = 3000; req.Proxy = null; req.AllowAutoRedirect = false;
