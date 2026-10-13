@@ -30,7 +30,7 @@ if(friend){var p=friend.persona,original=p.m_strGameExtraInfo,game=p.m_gameid;
  s.labels={};s.apply();result.labelCleared=p.m_strGameExtraInfo===original&&p.m_gameid===game;
 }
 }finally{
-var s=window.__cabinetLabels;if(s){s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);s.patches.forEach(function(m,p){Object.keys(m).forEach(function(n){if(p[n]===m[n].wrapped)p[n]=m[n].original;});});var w=s.spacewarInfo;if(w&&w.map.get(480)===w.copy)w.map.set(480,w.original);delete window.__cabinetLabels;}
+var s=window.__cabinetLabels;if(s){s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);if(s.pending)clearTimeout(s.pending);if(s.unpatchGroups)s.unpatchGroups();s.patches.forEach(function(m,p){Object.keys(m).forEach(function(n){if(p[n]===m[n].wrapped)p[n]=m[n].original;});});var w=s.spacewarInfo;if(w&&w.map.get(480)===w.copy)w.map.set(480,w.original);delete window.__cabinetLabels;}
 }
 result.restored=before.every(function(v){return v.p.m_strGameExtraInfo===v.name&&v.p.m_unGamePlayedAppID===v.app&&v.p.m_gameid===v.game;});result.stateRemoved=!window.__cabinetLabels;
 return result;
@@ -90,7 +90,7 @@ const v1=function(){};global.__cabinetLabels={labels:{},written:new Map([[q,{}]]
 Persona.prototype.UpdateFromMessage=v1;let cleared=0;global.clearInterval=()=>{cleared++;};
 ";
             string upgradeCheck = @"
-assert.equal(__cabinetLabels.version,5);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
+assert.equal(__cabinetLabels.version,6);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
 assert.notEqual(g_FriendsUIApp.AppInfoStore.m_mapAppInfo.get(480),spacewarOriginal);assert.equal(spacewarOriginal.icon_url,'icon-app-480');
 console.log('PASS older injected script replaced; Spacewar entry swapped, original untouched');
 class Groups{constructor(){this.m_mapGameGroups=new Map();} get games_with_friends_playing(){return Array.from(this.m_mapGameGroups.keys());} GetGameGroup(e){return this.m_mapGameGroups.get(e);} GetCountFriendsInGame(e){var x=this.m_mapGameGroups.get(e);return x?x.unfiltered_count:0;}}
@@ -102,8 +102,32 @@ assert.deepEqual(gs.games_with_friends_playing.sort(),[100,2868840]);assert.equa
 owned=false;__cabinetLabels.apply();
 assert.equal(gs.GetGameGroup(2868840),undefined);assert.equal(gs.GetCountFriendsInGame(480),1);assert.deepEqual(gs.games_with_friends_playing.sort(),[100,480]);
 console.log('PASS friends counted under the real game only when it is in the library');
+// Steam's store is MobX: games_with_friends_playing is a non-configurable computed on the instance.
+const sym=Symbol('mobx administration');
+class Mobx extends Groups{constructor(){super();const self=this,cv={derivation:Object.getOwnPropertyDescriptor(Groups.prototype,'games_with_friends_playing').get};
+ this[sym]={values_:new Map([['games_with_friends_playing',cv]])};this.cv=cv;Object.defineProperty(this,'games_with_friends_playing',{configurable:false,get:function(){return cv.derivation.call(self);}});}}
+const ms=new Mobx(),original2=ms.cv.derivation;ms.m_mapGameGroups.set(480,{member_list:[fq],unfiltered_count:1});ms.m_mapGameGroups.set(100,{member_list:[{}],unfiltered_count:1});
+g_FriendsUIApp.FriendStore.FriendGroupStore=ms;owned=true;__cabinetLabels.apply();
+assert.deepEqual(__cabinetLabels.errors,{});assert.equal(Object.getOwnPropertyNames(gs).indexOf('GetGameGroup'),-1);
+assert.deepEqual(ms.games_with_friends_playing.sort(),[100,2868840]);assert.equal(ms.GetCountFriendsInGame(2868840),1);assert.equal(ms.GetGameGroup(480),undefined);
+console.log('PASS MobX computed store patched through its derivation; previous store unpatched');
+// A failure inside a hook never reaches Steam: Steam's own result is used and the error recorded.
+const moved=__cabinetLabels.moved,one=__cabinetLabels.one;__cabinetLabels.moved=()=>{throw new Error('boom');};
+assert.equal(ms.GetGameGroup(100).unfiltered_count,1);assert.equal(ms.GetGameGroup(480).member_list[0],fq);assert.deepEqual(ms.games_with_friends_playing.sort(),[100,480]);
+__cabinetLabels.one=()=>{throw new Error('boom');};assert.equal(q.UpdateFromMessage(480,'x'),42);assert.equal(__cabinetLabels.errors.update,'boom');
+__cabinetLabels.apply();assert.equal(__cabinetLabels.errors.labels,'boom');
+__cabinetLabels.moved=moved;__cabinetLabels.one=one;__cabinetLabels.apply();assert.equal(__cabinetLabels.errors.labels,undefined);
+__cabinetLabels.unpatchGroups();assert.equal(ms.cv.derivation,original2);assert.equal(Object.getOwnPropertyNames(ms).indexOf('GetGameGroup'),-1);
+console.log('PASS hook failures fall back to Steam results; groups unpatch cleanly');
+// Version 5 left its group functions behind on Steam's store after failing; version 6 removes them.
+const v5=new Mobx();v5.GetGameGroup=function(e){var by=s.moved();};v5.GetCountFriendsInGame=function(e){var r=g.GetGameGroup(e);};
+g_FriendsUIApp.FriendStore.FriendGroupStore=v5;__cabinetLabels.version=5;
 ";
-            File.WriteAllText(path, mock + script + ";\n" + behavior + script + ";\n" + tail + upgrade + script + ";\n" + upgradeCheck);
+            string v5Check = @"
+assert.equal(__cabinetLabels.version,6);assert.notEqual(String(v5.GetGameGroup).indexOf('base'),-1);__cabinetLabels.unpatchGroups();assert.equal(Object.getOwnPropertyNames(v5).indexOf('GetGameGroup'),-1);
+console.log('PASS version 5 leftovers removed on upgrade');
+";
+            File.WriteAllText(path, mock + script + ";\n" + behavior + script + ";\n" + tail + upgrade + script + ";\n" + upgradeCheck + script + ";\n" + v5Check);
             using (var process = Process.Start(new ProcessStartInfo("bun", "\"" + path + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true }))
             {
                 var stderr = process.StandardError.ReadToEndAsync(); Console.Write(process.StandardOutput.ReadToEnd());

@@ -25,9 +25,15 @@ namespace Cabinet
         static string publishedKey;
         static Func<string, string, object, object> publishedRequest;
         static bool installed;
-        static readonly HashSet<string> logged = new HashSet<string>();
-        static void Once(Action<string> log, string kind, Exception ex)
-        { if (logged.Add(kind)) log(kind + ": " + ex.Message); }
+        // Each problem is logged when it starts or changes, and again when it clears.
+        static readonly Dictionary<string, string> problems = new Dictionary<string, string>();
+        static void Report(Action<string> log, string kind, string problem)
+        {
+            string last; bool had = problems.TryGetValue(kind, out last);
+            if (problem == null) { if (had) { problems.Remove(kind); log(kind + ": recovered"); } return; }
+            if (!had || last != problem) { problems[kind] = problem; log(kind + ": " + problem); }
+        }
+        static void Once(Action<string> log, string kind, Exception ex) { Report(log, kind, ex.Message); }
         internal static string CleanName(string name)
         {
             if (name == null) return "";
@@ -108,12 +114,17 @@ namespace Cabinet
                     {
                         // A failed fetch keeps the labels already in Steam (they expire on their own)
                         // instead of wiping them until the next successful round.
-                        try { labels = ReadPlayers(request("GET", "/api/presence", null), own); }
+                        try { labels = ReadPlayers(request("GET", "/api/presence", null), own); Report(log, "presence fetch failed", null); }
                         catch (Exception ex) { Once(log, "presence fetch failed", ex); return; }
                     }
                     if (connected || installed)
                     {
-                        try { Apply(labels); installed = connected; }
+                        try
+                        {
+                            string errors = Apply(labels); installed = connected;
+                            Report(log, "Steam friends debugger unavailable", null);
+                            Report(log, "friend labels script errors", string.IsNullOrEmpty(errors) || errors == "{}" ? null : errors);
+                        }
                         catch (Exception ex) { Once(log, "Steam friends debugger unavailable", ex); }
                     }
                 }
@@ -151,17 +162,25 @@ namespace Cabinet
 var store=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
 if(!store)throw new Error('Cabinet: friends store unavailable');
 var s=window.__cabinetLabels;
-if(s&&s.version!==5){
- s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);
+if(s&&s.version!==6){
+ try{s.labels={};s.written.forEach(function(v,p){s.clear(p);});}catch(e){}
+ clearInterval(s.timer);if(s.pending)clearTimeout(s.pending);
  s.patches.forEach(function(v,p){if(v.wrapped){if(p.UpdateFromMessage===v.wrapped)p.UpdateFromMessage=v.original;}
   else Object.keys(v).forEach(function(n){if(p[n]===v[n].wrapped)p[n]=v[n].original;});});
  var w=s.spacewarInfo;
  if(w&&w.copy){if(w.map.get(480)===w.copy)w.map.set(480,w.original);}else if(w)delete w.icon_url;
- if(s.groupStore){var gs=s.groupStore.store;delete gs.GetGameGroup;delete gs.GetCountFriendsInGame;delete gs.games_with_friends_playing;}
+ if(s.unpatchGroups)try{s.unpatchGroups();}catch(e){}
+ // Version 5 stopped halfway on Steam's MobX store and left these behind.
+ var gs=store.FriendGroupStore;
+ if(gs)['GetGameGroup','GetCountFriendsInGame','games_with_friends_playing'].forEach(function(n){var o=Object.getOwnPropertyDescriptor(gs,n);
+  if(o&&o.configurable&&/s\.moved|g\.GetGameGroup/.test(String(o.value||o.get)))delete gs[n];});
  s=null;
 }
 if(!s){
- s=window.__cabinetLabels={version:5,labels:{},written:new Map(),patches:new Map(),expires:0,fallback:'',sig:''};
+ s=window.__cabinetLabels={version:6,labels:{},written:new Map(),patches:new Map(),friends:new Map(),errors:{},expires:0,fallback:'',sig:''};
+ // Every hook runs inside Steam's own code: a failure is recorded and Steam's own result is used.
+ s.fail=function(n,e){s.errors[n]=String(e&&e.message||e).slice(0,200);};
+ s.step=function(n,f){try{f();delete s.errors[n];}catch(e){s.fail(n,e);}};
  // Friends relabeled to a game in this library are counted under that game (library
  // page, green badge, home carousel) instead of Spacewar. Not in the library: Spacewar.
  s.owned=function(app){var st=window.appStore;try{return !!(st&&st.GetAppOverviewByAppID&&st.GetAppOverviewByAppID(Number(app)));}catch(e){return false;}};
@@ -169,22 +188,35 @@ if(!s){
    if(v.friend&&p.m_unGamePlayedAppID===480&&p.m_gameid===v.app&&s.owned(v.app))(by[v.app]=by[v.app]||[]).push(v.friend);});return by;};
  s.group=function(list){return {member_list:list,member_list_unsorted:list,unfiltered_count:list.length,member_count:list.length};};
  s.patchGroups=function(){var g=store.FriendGroupStore;if(!g||(s.groupStore&&s.groupStore.store===g))return;
-  var map=g.m_mapGameGroups,d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(g),'games_with_friends_playing');
-  if(!map||typeof map.get!=='function'||typeof g.GetGameGroup!=='function'||!d||!d.get)return;
-  g.GetGameGroup=function(e){var by=s.moved(),base=map.get(e),extra=by[String(e)];
-   if(Number(e)===480&&base){var all=[];Object.keys(by).forEach(function(k){all=all.concat(by[k]);});
-    if(!all.length)return base;var left=base.member_list.filter(function(f){return all.indexOf(f)<0;});return left.length?s.group(left):undefined;}
-   return extra?s.group((base?base.member_list:[]).concat(extra)):base;};
-  g.GetCountFriendsInGame=function(e){var r=g.GetGameGroup(e);return r?r.unfiltered_count||0:0;};
-  Object.defineProperty(g,'games_with_friends_playing',{configurable:true,get:function(){
-   var keys=d.get.call(this).filter(function(k){return Number(k)!==480||!!g.GetGameGroup(480);});
-   Object.keys(s.moved()).forEach(function(k){if(keys.indexOf(Number(k))<0)keys.push(Number(k));});return keys;}});
-  s.groupStore={store:g,map:map};};
+  if(s.groupStore)s.unpatchGroups();
+  var proto=Object.getPrototypeOf(g),map=g.m_mapGameGroups,d=null,get=proto.GetGameGroup,count=proto.GetCountFriendsInGame;
+  for(var o=proto;o&&!d;o=Object.getPrototypeOf(o))d=Object.getOwnPropertyDescriptor(o,'games_with_friends_playing');
+  if(!map||typeof map.get!=='function'||typeof get!=='function'||!d||!d.get)return;
+  var u={store:g};
+  var keys=function(k){try{var r=k.filter(function(x){return Number(x)!==480||!!g.GetGameGroup(480);});
+    Object.keys(s.moved()).forEach(function(a){if(r.indexOf(Number(a))<0)r.push(Number(a));});return r;}catch(e){s.fail('games',e);return k;}};
+  g.GetGameGroup=function(e){var base=get.call(g,e);try{var by=s.moved(),extra=by[String(e)];
+    if(Number(e)===480&&base){var all=[];Object.keys(by).forEach(function(k){all=all.concat(by[k]);});
+     if(!all.length)return base;var left=base.member_list.filter(function(f){return all.indexOf(f)<0;});return left.length?s.group(left):undefined;}
+    return extra?s.group((base?base.member_list:[]).concat(extra)):base;}catch(x){s.fail('GetGameGroup',x);return base;}};
+  g.GetCountFriendsInGame=function(e){try{var r=g.GetGameGroup(e);return r?r.unfiltered_count||0:0;}
+    catch(x){s.fail('count',x);return typeof count==='function'?count.call(g,e):0;}};
+  var own=Object.getOwnPropertyDescriptor(g,'games_with_friends_playing');
+  if(own&&!own.configurable){
+   // Steam's store is MobX: the property is a non-configurable computed, so its derivation is wrapped.
+   var sym=Object.getOwnPropertySymbols(g).filter(function(x){return String(x)==='Symbol(mobx administration)';})[0],adm=sym&&g[sym],
+    cv=adm&&adm.values_&&typeof adm.values_.get==='function'&&adm.values_.get('games_with_friends_playing');
+   if(cv&&typeof cv.derivation==='function'){var od=cv.derivation;cv.derivation=function(){return keys(od.call(this));};u.computed={cv:cv,original:od,wrapped:cv.derivation};}
+  }else Object.defineProperty(g,'games_with_friends_playing',{configurable:true,get:function(){return keys(d.get.call(this));}});
+  s.groupStore=u;};
+ s.unpatchGroups=function(){var u=s.groupStore;if(!u)return;s.groupStore=null;delete u.store.GetGameGroup;delete u.store.GetCountFriendsInGame;
+  var o=Object.getOwnPropertyDescriptor(u.store,'games_with_friends_playing');if(o&&o.configurable)delete u.store.games_with_friends_playing;
+  if(u.computed&&u.computed.cv.derivation===u.computed.wrapped)u.computed.cv.derivation=u.computed.original;};
  // Components already rendered observe map keys, not our patch: touch the affected keys.
- s.nudge=function(){var w=s.groupStore;if(!w)return;var by=s.moved(),sig=JSON.stringify(Object.keys(by).map(function(k){return k+':'+by[k].length;}));
+ s.nudge=function(){var w=s.groupStore&&s.groupStore.store.m_mapGameGroups;if(!w)return;var by=s.moved(),sig=JSON.stringify(Object.keys(by).map(function(k){return k+':'+by[k].length;}));
   if(sig===s.sig)return;var keys=[480].concat(Object.keys(by).map(Number),s.sigKeys||[]);s.sig=sig;s.sigKeys=Object.keys(by).map(Number);
-  var any=w.map.get(480)||Array.from(w.map.values())[0];
-  keys.forEach(function(k){if(w.map.has(k)){var x=w.map.get(k);w.map.delete(k);w.map.set(k,x);}else if(any){w.map.set(k,any);w.map.delete(k);}});};
+  var any=w.get(480)||Array.from(w.values())[0];
+  keys.forEach(function(k){if(w.has(k)){var x=w.get(k);w.delete(k);w.set(k,x);}else if(any){w.set(k,any);w.delete(k);}});};
  s.spacewarIcon=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore,current=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
   if(!apps||!current)return null;
   var games=new Set(),unknown=false;
@@ -199,7 +231,7 @@ if(!s){
   if(!a||(s.spacewarInfo&&a===s.spacewarInfo.copy))return;
   var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'icon_url');if(!d||!d.get)return;
   var c=Object.create(Object.getPrototypeOf(a));Object.getOwnPropertyNames(a).forEach(function(k){c[k]=a[k];});
-  Object.defineProperty(c,'icon_url',{configurable:true,get:function(){return s.spacewarIcon()||d.get.call(this);}});
+  Object.defineProperty(c,'icon_url',{configurable:true,get:function(){try{var i=s.spacewarIcon();if(i)return i;}catch(e){s.fail('spacewarIcon',e);}return d.get.call(this);}});
   s.spacewarInfo={map:map,original:a,copy:c};map.set(480,c);};
  s.clear=function(p){var v=s.written.get(p);if(!v)return;
   if(p.m_strGameExtraInfo===v.name)p.m_strGameExtraInfo=v.beforeName;
@@ -216,25 +248,31 @@ if(!s){
  s.patch=function(proto,name,make){var m=s.patches.get(proto);if(!m){m={};s.patches.set(proto,m);}
   if(m[name]||typeof proto[name]!=='function')return;
   var original=proto[name],wrapped=make(original);m[name]={original:original,wrapped:wrapped};proto[name]=wrapped;};
- s.apply=function(){
+ s.labelAll=function(){
   if(Date.now()>s.expires)s.labels={};
   var current=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;if(!current)return;
   var friends=Array.from(current.all_friends),ids=new Map();
-  friends.forEach(function(f){if(f.persona)ids.set(f.persona,f.accountid);});
-  s.written.forEach(function(v,p){if(!ids.has(p))s.clear(p);});
+  friends.forEach(function(f){if(f.persona)ids.set(f.persona,f);});
+  s.written.forEach(function(v,p){if(!ids.has(p))s.clear(p);});s.friends=ids;
   friends.forEach(function(f){var p=f.persona;if(!p)return;
    var proto=Object.getPrototypeOf(p);
    if(proto){
-    s.patch(proto,'UpdateFromMessage',function(o){return function(){s.clear(this);var r=o.apply(this,arguments);s.apply();return r;};});
-    s.patch(proto,'GetCurrentGameIconURL',function(o){return function(){return s.icon(this)||o.apply(this,arguments);};});
+    // The updated persona is relabeled at once; store-wide work runs once per burst.
+    s.patch(proto,'UpdateFromMessage',function(o){return function(){
+     try{s.clear(this);}catch(e){s.fail('clear',e);}
+     var r=o.apply(this,arguments);
+     try{var f=s.friends.get(this);if(f)s.one(this,f.accountid,f);}catch(e){s.fail('update',e);}
+     s.later();return r;};});
+    s.patch(proto,'GetCurrentGameIconURL',function(o){return function(){try{var i=s.icon(this);if(i)return i;}catch(e){s.fail('icon',e);}return o.apply(this,arguments);};});
    }
    s.one(p,f.accountid,f);
   });
-  s.patchSpacewar();s.patchGroups();s.nudge();
  };
+ s.later=function(){if(s.pending)return;try{s.pending=setTimeout(function(){s.pending=0;s.apply();},250);}catch(e){s.pending=0;}};
+ s.apply=function(){s.step('labels',s.labelAll);s.step('spacewar',s.patchSpacewar);s.step('groups',s.patchGroups);s.step('nudge',s.nudge);};
  s.timer=setInterval(s.apply,5000);
 }
-s.fallback=fallback;s.labels=labels;s.expires=Date.now()+180000;s.apply();return true;
+s.fallback=fallback;s.labels=labels;s.expires=Date.now()+180000;s.apply();return JSON.stringify(s.errors);
 })(" + new JavaScriptSerializer().Serialize(labels) + "," + new JavaScriptSerializer().Serialize(FallbackIcon()) + ")";
         }
         static string fallbackIcon;
@@ -260,7 +298,8 @@ s.fallback=fallback;s.labels=labels;s.expires=Date.now()+180000;s.apply();return
             }
             return null;
         }
-        internal static void Apply(Dictionary<string, Label> labels)
+        // Returns the script's own error report ("{}" when every step worked).
+        internal static string Apply(Dictionary<string, Label> labels)
         {
             var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:8080/json");
             req.Timeout = 3000; req.ReadWriteTimeout = 3000; req.Proxy = null; req.AllowAutoRedirect = false;
@@ -268,7 +307,7 @@ s.fallback=fallback;s.labels=labels;s.expires=Date.now()+180000;s.apply();return
             using (var response = req.GetResponse()) using (var stream = response.GetResponseStream()) using (var reader = new StreamReader(stream))
             { char[] buffer = new char[1024 * 1024 + 1]; int length = reader.ReadBlock(buffer, 0, buffer.Length); if (length == buffer.Length) throw new IOException("Debugger target list too large"); json = new string(buffer, 0, length); }
             var target = SelectTarget(json); if (target == null) throw new IOException("SharedJSContext target missing");
-            Evaluate(target, BuildScript(labels));
+            object value; return CloudClient.Map(Evaluate(target, BuildScript(labels))).TryGetValue("value", out value) ? value as string : null;
         }
         internal static object Evaluate(Uri target, string script)
         {
