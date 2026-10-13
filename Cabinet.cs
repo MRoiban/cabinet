@@ -1837,6 +1837,8 @@ namespace Cabinet
         readonly SchemaFill schemas;
         readonly SessionMedia media;
         readonly ControllerLayouts controllers;
+        // Off until live Steam Input behaviour is verified; set CABINET_CONTROLLERS=1 to opt in.
+        static readonly bool ControllersEnabled = Environment.GetEnvironmentVariable("CABINET_CONTROLLERS") == "1";
         readonly Dictionary<string, string> syncTimes = new Dictionary<string, string>();
         DateTime nextUpdate = DateTime.UtcNow.AddMinutes(1);
         bool checkingUpdate, manualUpdate;
@@ -1857,6 +1859,7 @@ namespace Cabinet
             schemas = new SchemaFill(Log);
             media = new SessionMedia(Log);
             controllers = new ControllerLayouts(Log);
+            if (ControllersEnabled) Log("controller layouts enabled (CABINET_CONTROLLERS=1)");
             CloudSync.Configure(Log, playtime.QueueCloudMinutes, playtime.CloudMinutesInSteam, delegate { return playtime.RunningApps(); });
             WorkshopLinker.Initialize(Log);
             using (var stream = typeof(App).Assembly.GetManifestResourceStream("Cabinet.Icon"))
@@ -1896,12 +1899,15 @@ namespace Cabinet
                 var account = Syncer.AccountId();
                 var msg = playtime.Tick(account);
                 var running = playtime.RunningApps();
-                try
+                if (ControllersEnabled)
                 {
-                    var controllerMsg = controllers.Tick(running, account, playtime.LatestRunningApp(running));
-                    if (controllerMsg != null) QueueBalloon(controllerMsg);
+                    try
+                    {
+                        var controllerMsg = controllers.Tick(running, account, playtime.LatestRunningApp(running));
+                        if (controllerMsg != null) QueueBalloon(controllerMsg);
+                    }
+                    catch (Exception ex) { Log("controller error: " + ex.Message); }
                 }
-                catch (Exception ex) { Log("controller error: " + ex.Message); }
                 var workshopMsg = WorkshopLinker.Tick(running);
                 if (workshopMsg != null) QueueBalloon(workshopMsg);
                 try { media.Tick(running, account); }
