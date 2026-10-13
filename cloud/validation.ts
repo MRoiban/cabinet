@@ -1,0 +1,54 @@
+import { BedrockError } from "bedrock";
+
+export function invalid(message: string): never {
+  throw new BedrockError("INVALID_ARGS", message, "Follow docs/cloud-api.md.");
+}
+export function record(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid("Expected a JSON object.");
+  return value as Record<string, unknown>;
+}
+export function label(value: unknown, max = 200): string {
+  if (typeof value !== "string" || !value.trim() || value.length > max || /[\u0000-\u001f]/.test(value)) invalid("Invalid name or device identifier.");
+  return value;
+}
+export function timestamp(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) invalid("Expected a nonnegative integer timestamp.");
+  return value;
+}
+export function numericMap(value: unknown, times = false): Record<string, number> {
+  const entries = Object.entries(record(value));
+  if (entries.length > 10000) invalid("Too many entries.");
+  for (const [key, n] of entries) {
+    label(key);
+    if (typeof n !== "number" || !Number.isFinite(n)) invalid("Expected finite numeric values.");
+    if (times) timestamp(n);
+  }
+  return Object.fromEntries(entries) as Record<string, number>;
+}
+export function appId(path: string): string {
+  const id = path.split("/")[3] ?? "";
+  if (!/^\d{1,10}$/.test(id)) invalid("Invalid appid.");
+  return id;
+}
+export async function smallBody(request: Request): Promise<string> {
+  const limit = 1024 * 1024;
+  if (Number(request.headers.get("content-length")) > limit) invalid("Request is too large.");
+  const reader = request.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > limit) { await reader.cancel(); invalid("Request is too large."); }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+export async function jsonBody(request: Request): Promise<Record<string, unknown>> {
+  const body = await smallBody(request);
+  let value: unknown;
+  try { value = JSON.parse(body); } catch { invalid("Malformed JSON."); }
+  return record(value);
+}

@@ -439,6 +439,177 @@ namespace Cabinet
         public int StatsReceivedResult { get; private set; }
         DateTime lastStore = DateTime.MinValue;
 
+        // SteamFriends018 / SteamMatchMaking009: indices from the Valve headers.
+        [StructLayout(LayoutKind.Sequential, Pack = 8)] struct FriendGame { public ulong Game; public uint IP; public ushort Port, QueryPort; public ulong Lobby; }
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] [return: MarshalAs(UnmanagedType.I1)] delegate bool FriendPlayed(IntPtr self, ulong id, out FriendGame game);
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate IntPtr PresenceGet(IntPtr self, ulong id, [MarshalAs(UnmanagedType.LPStr)] string key);
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] [return: MarshalAs(UnmanagedType.I1)] delegate bool PresenceSet(IntPtr self, [MarshalAs(UnmanagedType.LPStr)] string key, IntPtr value);
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate void PresenceClear(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate ulong LobbyCreate(IntPtr self, int type, int members);
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate void LobbyLeave(IntPtr self, ulong lobby);
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)] [return: MarshalAs(UnmanagedType.I1)] delegate bool CallResult(IntPtr self, ulong call, IntPtr buffer, int size, int expected, [MarshalAs(UnmanagedType.I1)] out bool failed);
+        IntPtr friends;
+        ulong localId;
+        bool presenceOwned, joinDisabled;
+        string presenceFingerprint;
+        DateTime lastPresenceAttempt = DateTime.MinValue;
+
+        void Friends()
+        {
+            if (friends != IntPtr.Zero) return;
+            friends = Function<GetInterface>(client, 8)(client, user, pipe, "SteamFriends018");
+            localId = 76561197960265728UL + uint.Parse(Syncer.AccountId(), CultureInfo.InvariantCulture);
+        }
+        string Presence(string key)
+        {
+            var p = Function<PresenceGet>(friends, 43)(friends, localId, key);
+            if (p == IntPtr.Zero) return "";
+            int count = 0;
+            while (count < 256 && Marshal.ReadByte(p, count) != 0) count++;
+            if (count == 256) return "";
+            var bytes = new byte[count]; Marshal.Copy(p, bytes, 0, count);
+            return Encoding.UTF8.GetString(bytes);
+        }
+        bool SetPresence(string key, string value)
+        {
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                if (value != null)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(value + "\0");
+                    buffer = Marshal.AllocHGlobal(bytes.Length); Marshal.Copy(bytes, 0, buffer, bytes.Length);
+                }
+                return Function<PresenceSet>(friends, 41)(friends, key, buffer);
+            }
+            finally { if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer); }
+        }
+        public void JoinProbe(bool producer, int seconds)
+        {
+            Friends();
+            IntPtr matchmaking = IntPtr.Zero; ulong lobby = 0;
+            try
+            {
+                if (producer)
+                {
+                    matchmaking = Function<GetInterface>(client, 10)(client, user, pipe, "SteamMatchMaking009");
+                    var utils = Function<GetUtils>(client, 9)(client, pipe, "SteamUtils011");
+                    ulong call = Function<LobbyCreate>(matchmaking, 13)(matchmaking, 0, 2);
+                    var buffer = Marshal.AllocHGlobal(16);
+                    try
+                    {
+                        var until = DateTime.UtcNow.AddSeconds(10); bool failed;
+                        while (DateTime.UtcNow < until)
+                        {
+                            Pump();
+                            if (Function<CallResult>(utils, 12)(utils, call, buffer, 16, 513, out failed))
+                            {
+                                if (!failed && Marshal.ReadInt32(buffer) == 1) lobby = (ulong)Marshal.ReadInt64(buffer, 8);
+                                log("join probe: lobby result=" + Marshal.ReadInt32(buffer) + " failed=" + failed + " lobby=" + lobby); break;
+                            }
+                            Thread.Sleep(100);
+                        }
+                    }
+                    finally { Marshal.FreeHGlobal(buffer); }
+                }
+                log("join probe initial " + appId + ": connect=" + Presence("connect"));
+                if (producer || appId != "480")
+                {
+                    string connect = producer && lobby != 0 ? "+connect_lobby " + lobby : "cabinet-probe";
+                    foreach (var kv in new[] { new[] { "connect", connect }, new[] { "status", L.T("Cabinet join probe", "Test de connexion Cabinet") }, new[] { "steam_display", "#Status_InGame" } })
+                        log("join probe: set " + kv[0] + " accepted=" + SetPresence(kv[0], kv[1]));
+                    presenceOwned = true;
+                }
+                var end = DateTime.UtcNow.AddSeconds(Math.Min(45, seconds));
+                while (DateTime.UtcNow < end)
+                {
+                    Pump(); FriendGame game;
+                    bool ok = Function<FriendPlayed>(friends, 7)(friends, localId, out game);
+                    log("join probe " + appId + ": local game readable=" + ok + " game=" + game.Game + " lobby=" + game.Lobby + " connect=" + Presence("connect") + " group=" + Presence("steam_player_group"));
+                    Thread.Sleep(1000);
+                }
+            }
+            finally
+            {
+                if (lobby != 0) { Function<LobbyLeave>(matchmaking, 15)(matchmaking, lobby); log("join probe: left test lobby"); }
+                if (presenceOwned) { Function<PresenceClear>(friends, 42)(friends); presenceOwned = false; log("join probe: cleared presence"); }
+            }
+        }
+
+        public string PresenceSnapshot()
+        {
+            Friends(); FriendGame game;
+            bool played = Function<FriendPlayed>(friends, 7)(friends, localId, out game);
+            string connect = Presence("connect");
+            if (string.IsNullOrEmpty(connect) && played && game.Game == 480 && game.Lobby != 0) connect = "+connect_lobby " + game.Lobby;
+            return new JavaScriptSerializer().Serialize(new Dictionary<string, string> {
+                { "stamp", Playtime.Unix(DateTime.UtcNow).ToString(CultureInfo.InvariantCulture) },
+                { "connect", connect }, { "steam_player_group", Presence("steam_player_group") },
+                { "steam_player_group_size", Presence("steam_player_group_size") }, { "status", Presence("status") } });
+        }
+        public void MirrorProbe(string source, int seconds)
+        {
+            Friends();
+            for (int i = 0; i < Math.Min(30, seconds); i++)
+            {
+                Pump(); MirrorJoin(source);
+                log("mirror probe: real connect=" + Presence("connect"));
+                Thread.Sleep(1000);
+            }
+        }
+        public void CaptureProbe()
+        {
+            var screenshots = Function<GetInterface>(client, 18)(client, user, pipe, "STEAMSCREENSHOTS_INTERFACE_VERSION003");
+            Function<PresenceClear>(screenshots, 2)(screenshots);
+            log("capture probe: TriggerScreenshot called for " + appId);
+            for (int i = 0; i < 50; i++) { Pump(); Thread.Sleep(100); }
+        }
+
+        public void MirrorJoin(string source)
+        {
+            if (joinDisabled) return;
+            try
+            {
+                Friends();
+                var keys = new[] { "connect", "steam_player_group", "steam_player_group_size", "status" };
+                var values = new string[keys.Length];
+                Dictionary<string, string> snapshot = null;
+                if (source != null && File.Exists(source))
+                {
+                    snapshot = new JavaScriptSerializer().Deserialize<Dictionary<string, string>>(File.ReadAllText(source));
+                    long stamp; string text;
+                    if (!snapshot.TryGetValue("stamp", out text) || !long.TryParse(text, out stamp) || Math.Abs(Playtime.Unix(DateTime.UtcNow) - stamp) > 5) snapshot = null;
+                }
+                for (int i = 0; i < keys.Length; i++)
+                {
+                    string value;
+                    values[i] = snapshot != null && snapshot.TryGetValue(keys[i], out value) && value != null && Encoding.UTF8.GetByteCount(value) < 256 ? value : "";
+                }
+                string fingerprint = string.Join("\n", values);
+                if (fingerprint == presenceFingerprint) return;
+                if (values.All(string.IsNullOrEmpty))
+                {
+                    if (presenceOwned) { Function<PresenceClear>(friends, 42)(friends); presenceOwned = false; }
+                    presenceFingerprint = fingerprint;
+                    return;
+                }
+                if (DateTime.UtcNow - lastPresenceAttempt < TimeSpan.FromSeconds(5)) return;
+                lastPresenceAttempt = DateTime.UtcNow;
+                bool accepted = true;
+                for (int i = 0; i < keys.Length; i++)
+                    if (!SetPresence(keys[i], values[i].Length == 0 ? null : values[i])) { accepted = false; log("shadow " + appId + ": rich presence rejected: " + keys[i]); }
+                presenceOwned = true;
+                if (accepted) { presenceFingerprint = fingerprint; log("shadow " + appId + ": mirrored join presence"); }
+            }
+            catch (IOException) { } // Atomic relay replacement can briefly race a read.
+            catch (Exception ex)
+            {
+                joinDisabled = true;
+                if (presenceOwned) { try { Function<PresenceClear>(friends, 42)(friends); } catch { } presenceOwned = false; }
+                log("shadow " + appId + ": join mirroring unavailable: " + ex.Message);
+            }
+        }
+
         static T Function<T>(IntPtr obj, int index) where T : class
         {
             if (obj == IntPtr.Zero) throw new InvalidOperationException("Steam interface unavailable");
@@ -483,6 +654,8 @@ namespace Cabinet
             {
                 try
                 {
+                    if (c.Id == 2301 && c.Size >= 8) log("capture probe: ScreenshotReady handle=" + Marshal.ReadInt32(c.Data) + " result=" + Marshal.ReadInt32(c.Data, 4));
+                    if (c.Id == 333 || c.Id == 337) log("shadow " + appId + ": join callback " + c.Id + " received; cross-app callback forwarding is unavailable");
                     if ((c.Id == 1101 || c.Id == 1102) && c.Size >= 12)
                     {
                         log("shadow " + appId + ": callback " + c.Id + " app=" + Marshal.ReadInt64(c.Data) + " result=" + Marshal.ReadInt32(c.Data, 8));
@@ -554,6 +727,7 @@ namespace Cabinet
         }
         public void Dispose()
         {
+            if (presenceOwned && friends != IntPtr.Zero) { try { Function<PresenceClear>(friends, 42)(friends); } catch (Exception ex) { log("shadow presence clear: " + ex.Message); } presenceOwned = false; }
             if (client != IntPtr.Zero && pipe != 0)
             {
                 if (user != 0) { Function<ReleaseUser>(client, 4)(client, pipe, user); user = 0; }
@@ -758,6 +932,379 @@ namespace Cabinet
             while (pos > 0 && Text[pos - 1] != '\n') pos--;
             return pos;
         }
+
+        // Move one indexed screenshot at a time, preserving all unrelated VDF text.
+        internal bool RefileScreenshot(string remote, Func<long, string> assign, Action<string> log, Func<bool> canWrite, Action beforeWrite)
+        {
+            int screenshots = Block("screenshots"), source = Block("screenshots", "480");
+            if (screenshots < 0 || source < 0) return false;
+            int sourceEnd = Match(source);
+            for (int i = source + 1; i < sourceEnd; i++)
+            {
+                if (toks[i].Kind != 's' || i + 1 >= sourceEnd || toks[i + 1].Kind != '{') throw new InvalidDataException("Unexpected screenshot VDF structure");
+                int entry = i + 1, end = Match(entry);
+                long created; string target;
+                if (!long.TryParse(Value(entry, "creation"), out created) || (target = assign(created)) == null) { i = end; continue; }
+                string uploaded = Value(entry, "hscreenshot");
+                if (uploaded != null && uploaded != "0" && uploaded != "18446744073709551615") { i = end; continue; }
+                string filename = Value(entry, "filename"), thumbnail = Value(entry, "thumbnail");
+                if (Value(entry, "gameid") != "480" || filename == null || !filename.StartsWith("480/screenshots/", StringComparison.Ordinal) || (thumbnail != null && !thumbnail.StartsWith("480/screenshots/thumbnails/", StringComparison.Ordinal))) { i = end; continue; }
+                var moves = new List<KeyValuePair<string, string>>();
+                foreach (var rel in new[] { filename, thumbnail })
+                {
+                    if (string.IsNullOrEmpty(rel)) continue;
+                    string from = SafeMediaPath(remote, rel), to = SafeMediaPath(remote, target + rel.Substring(3));
+                    if (!File.Exists(from) || File.Exists(to)) { moves.Clear(); break; }
+                    moves.Add(new KeyValuePair<string, string>(from, to));
+                }
+                if (moves.Count == 0) { i = end; continue; }
+                int dest = Block("screenshots", target), number = 0;
+                while (dest >= 0 && Child(dest, number.ToString(CultureInfo.InvariantCulture)) >= 0) number++;
+                string block = Text.Substring(toks[entry].Start, toks[end].End - toks[entry].Start);
+                var edits = new List<KeyValuePair<int, KeyValuePair<int, string>>>();
+                foreach (var key in new[] { "gameid", "filename", "thumbnail" })
+                {
+                    int k = Child(entry, key);
+                    if (k < 0) continue;
+                    var value = toks[k + 1];
+                    string next = key == "gameid" ? target : target + value.Text.Substring(3);
+                    edits.Add(new KeyValuePair<int, KeyValuePair<int, string>>(value.Start - toks[entry].Start, new KeyValuePair<int, string>(value.End - value.Start, "\"" + next.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"")));
+                }
+                foreach (var edit in edits.OrderByDescending(e => e.Key)) block = block.Remove(edit.Key, edit.Value.Key).Insert(edit.Key, edit.Value.Value);
+                string moved = "\n\t\t\"" + number + "\"\n\t\t" + block + "\n";
+                int insert = dest < 0 ? toks[Match(screenshots)].Start : toks[Match(dest)].Start;
+                if (dest < 0) moved = "\n\t\"" + target + "\"\n\t{" + moved + "\t}\n";
+                string nextText = Text.Insert(insert, moved);
+                int removeStart = toks[i].Start, removeEnd = toks[end].End;
+                if (insert <= removeStart) { removeStart += moved.Length; removeEnd += moved.Length; }
+                nextText = nextText.Remove(removeStart, removeEnd - removeStart);
+                // Copy first; originals survive a crash before the index is committed.
+                var copied = new List<string>();
+                try
+                {
+                    beforeWrite();
+                    string backup = Path.Combine(Path.GetDirectoryName(remote), "cabinet-backup", Guid.NewGuid().ToString("N"));
+                    foreach (var move in moves)
+                    {
+                        if (!canWrite()) throw new IOException("Steam restarted during screenshot preparation");
+                        string original = Path.Combine(backup, move.Key.Substring(Path.GetFullPath(remote).TrimEnd('\\').Length + 1));
+                        Directory.CreateDirectory(Path.GetDirectoryName(original)); File.Copy(move.Key, original);
+                    }
+                    foreach (var move in moves)
+                    {
+                        if (!canWrite()) throw new IOException("Steam restarted during screenshot preparation");
+                        Directory.CreateDirectory(Path.GetDirectoryName(move.Value)); File.Copy(move.Key, move.Value); copied.Add(move.Value);
+                    }
+                }
+                catch { foreach (var copy in copied) { try { File.Delete(copy); } catch { } } throw; }
+                Text = nextText;
+                Tokenize();
+                // Deletion happens only after the caller atomically commits the index.
+                PendingMediaDeletes = moves.Select(m => m.Key).ToArray();
+                PendingMediaCopies = copied.ToArray();
+                log("media: prepared screenshot for " + target);
+                return true;
+            }
+            return false;
+        }
+        internal string[] PendingMediaDeletes;
+        internal string[] PendingMediaCopies;
+        string Value(int block, string key)
+        {
+            int k = Child(block, key);
+            return k >= 0 && k + 1 < toks.Count && toks[k + 1].Kind == 's' ? toks[k + 1].Text : null;
+        }
+        static string SafeMediaPath(string root, string relative)
+        {
+            string full = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
+            if (!full.StartsWith(Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || relative.Contains(":") || relative.Split(new[] { '/', '\\' }).Any(p => p == "..")) throw new InvalidDataException("Unsafe screenshot path");
+            EnsureMediaParents(full);
+            return full;
+        }
+        internal static void EnsureMediaParents(string path)
+        {
+            for (string p = Path.GetFullPath(path); p != null; p = Path.GetDirectoryName(p))
+                if (WorkshopEngine.Exists(p) && (File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException("Media reparse points are unsupported");
+        }
+    }
+
+    // Conservative session attribution: only observed intervals, scoped to the Steam account.
+    // Media is edited only after Steam exits; unknown formats and overlapping games are skipped.
+    sealed class SessionMedia
+    {
+        sealed class Interval { public string Account, App; public long Start, End; }
+        readonly List<Interval> intervals = new List<Interval>();
+        readonly Dictionary<string, Interval> active = new Dictionary<string, Interval>();
+        readonly Action<string> log;
+        readonly string ledger;
+        readonly string dataDir, steamRoot;
+        readonly Func<bool> steamRunning;
+        DateTime nextApply = DateTime.MinValue;
+        public SessionMedia(Action<string> logger) : this(logger, App.DataDir, Syncer.SteamPath(), Playtime.SteamRunning) { }
+        internal SessionMedia(Action<string> logger, string storage, string steam, Func<bool> running)
+        {
+            log = logger; dataDir = storage; steamRoot = steam; steamRunning = running;
+            ledger = Path.Combine(dataDir, "onlinefix-sessions.tsv");
+            if (!File.Exists(ledger)) return;
+            foreach (var line in File.ReadAllLines(ledger))
+            {
+                var p = line.Split('\t'); long start, end; uint account, app;
+                if (p.Length != 4 || !uint.TryParse(p[0], out account) || !uint.TryParse(p[1], out app) || app == 0 || app == 480 || !long.TryParse(p[2], out start) || !long.TryParse(p[3], out end) || start <= 0 || end < start) continue;
+                intervals.Add(new Interval { Account = p[0], App = p[1], Start = start, End = end });
+            }
+        }
+        public void Tick(HashSet<string> running, string account)
+        {
+            long now = Playtime.Unix(DateTime.UtcNow);
+            foreach (var id in active.Keys.ToArray())
+                if (!running.Contains(id) || active[id].Account != account || now - active[id].End > 20) active.Remove(id);
+            uint parsed;
+            if (account != null && uint.TryParse(account, out parsed)) foreach (var id in running)
+            {
+                if (!uint.TryParse(id, out parsed) || id == "480" || parsed == 0) continue;
+                Interval session;
+                if (!active.TryGetValue(id, out session))
+                {
+                    session = new Interval { Account = account, App = id, Start = now, End = now };
+                    intervals.Add(session); active[id] = session;
+                    log("media: session started for " + id);
+                }
+                session.End = now;
+            }
+            if (active.Count > 0) Save();
+            if (running.Count > 0 || steamRunning() || Shadows.AnyHelper() || DateTime.UtcNow < nextApply) return;
+            nextApply = DateTime.UtcNow.AddMinutes(1);
+            foreach (var acct in intervals.Select(s => s.Account).Distinct().ToArray())
+            {
+                try { Apply(acct); }
+                catch (Exception ex) { log("media: deferred: " + ex.Message); }
+            }
+        }
+        void Save()
+        {
+            Directory.CreateDirectory(dataDir);
+            string tmp = ledger + ".tmp";
+            File.WriteAllLines(tmp, intervals.Select(s => string.Join("\t", s.Account, s.App, s.Start, s.End)).ToArray());
+            if (File.Exists(ledger)) File.Replace(tmp, ledger, null); else File.Move(tmp, ledger);
+        }
+        internal string Assign(string account, long start, long end)
+        {
+            if (end < start) return null;
+            var hits = intervals.Where(s => s.Account == account && s.Start <= end && s.End >= start).ToArray();
+            if (hits.Length != 1 || hits[0].Start > start || hits[0].End < end) return null;
+            return hits[0].App;
+        }
+        void Apply(string account)
+        {
+            string root = Path.Combine(steamRoot, "userdata", account);
+            string index = Path.Combine(root, "760", "screenshots.vdf");
+            if (File.Exists(index))
+            {
+                VdfText.EnsureMediaParents(index);
+                if (steamRunning()) return;
+                var vdf = new VdfText(File.ReadAllText(index, Encoding.UTF8));
+                while (!steamRunning() && vdf.RefileScreenshot(Path.Combine(root, "760", "remote"), delegate(long stamp) { return Assign(account, stamp, stamp); }, log, delegate { return !steamRunning(); }, delegate { File.Copy(index, index + ".cabinet-backup-" + Guid.NewGuid().ToString("N")); }))
+                {
+                    try
+                    {
+                        if (steamRunning()) throw new IOException("Steam restarted during media preparation");
+                        string tmp = index + ".cabinet-tmp";
+                        File.WriteAllText(tmp, vdf.Text, new UTF8Encoding(false));
+                        if (steamRunning()) throw new IOException("Steam restarted before screenshot commit");
+                        File.Replace(tmp, index, index + ".cabinet-backup-" + Guid.NewGuid().ToString("N"));
+                    }
+                    catch { foreach (var copy in vdf.PendingMediaCopies) { try { File.Delete(copy); } catch { } } throw; }
+                    foreach (var original in vdf.PendingMediaDeletes) { if (steamRunning()) return; File.Delete(original); }
+                }
+            }
+            string clips = Path.Combine(root, "gamerecordings", "clips");
+            if (!Directory.Exists(clips)) return;
+            foreach (var clip in Directory.GetDirectories(clips, "clip_480_*"))
+            {
+                if (steamRunning()) return;
+                try { RefileClip(clip, account); }
+                catch (Exception ex) { log("media: clip skipped: " + ex.Message); }
+            }
+        }
+
+        // Minimal protobuf wire reader/writer. Unknown fields retain their original bytes.
+        sealed class Field { public int Number, Wire; public ulong Integer; public byte[] Data; }
+        static ulong Varint(byte[] bytes, ref int pos)
+        {
+            ulong value = 0;
+            for (int shift = 0; shift < 70; shift += 7)
+            {
+                if (pos >= bytes.Length) throw new InvalidDataException("Truncated protobuf");
+                byte b = bytes[pos++];
+                if (shift == 63 && b > 1) throw new InvalidDataException("Overflowing protobuf");
+                value |= (ulong)(b & 127) << shift;
+                if (b < 128) return value;
+            }
+            throw new InvalidDataException("Invalid protobuf varint");
+        }
+        static void Varint(Stream stream, ulong value)
+        {
+            while (value >= 128) { stream.WriteByte((byte)((value & 127) | 128)); value >>= 7; }
+            stream.WriteByte((byte)value);
+        }
+        static List<Field> Parse(byte[] bytes)
+        {
+            var fields = new List<Field>(); int pos = 0;
+            while (pos < bytes.Length)
+            {
+                ulong tag = Varint(bytes, ref pos);
+                var f = new Field { Number = (int)(tag >> 3), Wire = (int)(tag & 7) };
+                if (f.Number <= 0) throw new InvalidDataException("Invalid protobuf field");
+                if (f.Wire == 0) f.Integer = Varint(bytes, ref pos);
+                else
+                {
+                    int count = f.Wire == 1 ? 8 : f.Wire == 5 ? 4 : f.Wire == 2 ? checked((int)Varint(bytes, ref pos)) : -1;
+                    if (count < 0 || count > bytes.Length - pos) throw new InvalidDataException("Unsupported protobuf field");
+                    f.Data = new byte[count]; Buffer.BlockCopy(bytes, pos, f.Data, 0, count); pos += count;
+                }
+                fields.Add(f);
+            }
+            return fields;
+        }
+        static byte[] Encode(List<Field> fields)
+        {
+            using (var stream = new MemoryStream())
+            {
+                foreach (var f in fields)
+                {
+                    Varint(stream, (ulong)((f.Number << 3) | f.Wire));
+                    if (f.Wire == 0) Varint(stream, f.Integer);
+                    else { if (f.Wire == 2) Varint(stream, (ulong)f.Data.Length); stream.Write(f.Data, 0, f.Data.Length); }
+                }
+                return stream.ToArray();
+            }
+        }
+        static ulong Required(List<Field> fields, int number)
+        {
+            var matches = fields.Where(f => f.Number == number && f.Wire == 0).ToArray();
+            if (matches.Length != 1) throw new InvalidDataException("Missing/duplicate recording field " + number);
+            return matches[0].Integer;
+        }
+        static string Identifier(string value, string target)
+        {
+            if (System.Text.RegularExpressions.Regex.IsMatch(value, @"^timeline_480\d{8}_\d{6}$")) return "timeline_" + target + value.Substring(12);
+            if (System.Text.RegularExpressions.Regex.IsMatch(value, @"^bg_480_\d{8}_\d{6}$")) return "bg_" + target + value.Substring(6);
+            if (System.Text.RegularExpressions.Regex.IsMatch(value, @"^clip_480_\d{8}_\d{6}$")) return "clip_" + target + value.Substring(8);
+            return value;
+        }
+        static byte[] Rewrite(byte[] bytes, string kind, string target)
+        {
+            var fields = Parse(bytes);
+            foreach (var f in fields)
+            {
+                int appField = kind == "clip" ? 4 : kind == "timeline" ? 2 : kind == "tag" || kind == "event" ? 1 : -1;
+                if (f.Number == appField && f.Wire == 0)
+                {
+                    if (f.Integer != 480) throw new InvalidDataException("Mixed recording app IDs");
+                    f.Integer = ulong.Parse(target, CultureInfo.InvariantCulture);
+                }
+                if (f.Wire != 2) continue;
+                string child = kind == "clip" && f.Number == 1 ? "timeline" : kind == "clip" && f.Number == 14 ? "tag" : kind == "timeline" && f.Number == 5 ? "recording" : kind == "timeline" && f.Number == 7 ? "event" : kind == "tag" && f.Number == 3 ? "reference" : null;
+                if (child != null) f.Data = Rewrite(f.Data, child, target);
+                else if ((kind == "timeline" || kind == "recording") && f.Number == 1 || kind == "event" && f.Number == 4 || kind == "reference" && (f.Number == 1 || f.Number == 2))
+                    f.Data = Encoding.UTF8.GetBytes(Identifier(new UTF8Encoding(false, true).GetString(f.Data), target));
+            }
+            return Encode(fields);
+        }
+        static object JsonRewrite(object value, string target)
+        {
+            var dictionary = value as Dictionary<string, object>;
+            if (dictionary != null)
+            {
+                foreach (var key in dictionary.Keys.ToArray())
+                {
+                    if (key.Equals("appid", StringComparison.OrdinalIgnoreCase) || key.Equals("gameid", StringComparison.OrdinalIgnoreCase) || key == "game_id")
+                    {
+                        if (Convert.ToString(dictionary[key], CultureInfo.InvariantCulture) != "480") throw new InvalidDataException("Mixed timeline app IDs");
+                        dictionary[key] = dictionary[key] is string ? (object)target : long.Parse(target, CultureInfo.InvariantCulture);
+                    }
+                    else dictionary[key] = JsonRewrite(dictionary[key], target);
+                }
+            }
+            else if (value is object[]) { var array = (object[])value; for (int i = 0; i < array.Length; i++) array[i] = JsonRewrite(array[i], target); }
+            else if (value is string) return Identifier((string)value, target);
+            return value;
+        }
+        static void CopyTree(string source, string dest)
+        {
+            if ((File.GetAttributes(source) & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("Recording links are unsupported");
+            Directory.CreateDirectory(dest);
+            foreach (var file in Directory.GetFiles(source))
+            {
+                if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("Recording links are unsupported");
+                File.Copy(file, Path.Combine(dest, Path.GetFileName(file)));
+            }
+            foreach (var dir in Directory.GetDirectories(source)) CopyTree(dir, Path.Combine(dest, Path.GetFileName(dir)));
+        }
+        void RefileClip(string source, string account)
+        {
+            VdfText.EnsureMediaParents(source);
+            string pb = Path.Combine(source, "clip.pb");
+            VdfText.EnsureMediaParents(pb);
+            if (!File.Exists(pb) || new FileInfo(pb).Length > 16 * 1024 * 1024) return;
+            var data = File.ReadAllBytes(pb); var fields = Parse(data);
+            if (Required(fields, 4) != 480 || fields.Any(f => f.Number == 5 && (f.Wire != 1 || f.Data.Any(b => b != 0)))) return; // uploaded clip
+            long start = checked((long)Required(fields, 3));
+            ulong duration = 0;
+            foreach (var timeline in fields.Where(f => f.Number == 1 && f.Wire == 2)) duration = checked(duration + Required(Parse(timeline.Data), 4));
+            if (duration == 0) return;
+            string target = Assign(account, start, checked(start + (long)((duration + 999) / 1000)));
+            if (target == null) return;
+            string name = Identifier(Path.GetFileName(source), target);
+            if (name == Path.GetFileName(source)) return;
+            string dest = Path.Combine(Path.GetDirectoryName(source), name);
+            if (Directory.Exists(dest)) return;
+            string recordingRoot = Path.GetDirectoryName(Path.GetDirectoryName(source));
+            string stage = Path.Combine(recordingRoot, ".cabinet-stage-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+            CopyTree(source, stage); // Full original survives; all metadata backups precede writes.
+            File.Copy(Path.Combine(stage, "clip.pb"), Path.Combine(stage, "clip.pb.cabinet-backup"));
+            File.WriteAllBytes(Path.Combine(stage, "clip.pb"), Rewrite(data, "clip", target));
+            var serializer = new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024, RecursionLimit = 100 };
+            foreach (var file in Directory.GetFiles(stage, "*.json", SearchOption.AllDirectories))
+            {
+                File.Copy(file, file + ".cabinet-backup");
+                File.WriteAllText(file, serializer.Serialize(JsonRewrite(serializer.DeserializeObject(File.ReadAllText(file)), target)), new UTF8Encoding(false));
+            }
+            // Internal protobuf formats other than clip.pb are not known: leave the clip alone.
+            if (Directory.GetFiles(stage, "*.pb", SearchOption.AllDirectories).Any(f => f != Path.Combine(stage, "clip.pb"))) throw new InvalidDataException("Unknown recording protobuf metadata");
+            foreach (var dir in Directory.GetDirectories(stage, "*", SearchOption.AllDirectories).OrderByDescending(d => d.Length))
+            {
+                string renamed = Identifier(Path.GetFileName(dir), target);
+                if (renamed != Path.GetFileName(dir)) Directory.Move(dir, Path.Combine(Path.GetDirectoryName(dir), renamed));
+            }
+            foreach (var file in Directory.GetFiles(stage, "*", SearchOption.AllDirectories))
+            {
+                string stem = Path.GetFileNameWithoutExtension(file), renamed = Identifier(stem, target);
+                if (stem != renamed) File.Move(file, Path.Combine(Path.GetDirectoryName(file), renamed + Path.GetExtension(file)));
+            }
+            if (steamRunning()) throw new IOException("Steam restarted during clip preparation");
+            // Publish a complete copy first. A crash can leave duplicates, never missing media.
+            Directory.Move(stage, dest);
+            string backup = Path.Combine(recordingRoot, "cabinet-backup", Guid.NewGuid().ToString("N"), Path.GetFileName(source));
+            Directory.CreateDirectory(Path.GetDirectoryName(backup));
+            if (steamRunning()) return; // Complete destination and original both survive.
+            Directory.Move(source, backup);
+            log("media: refiled recording for " + target + "; full original backed up");
+            }
+            finally
+            {
+                // This generated stage is exclusively our copy, never the source.
+                // Verify its resolved parent before any recursive cleanup.
+                if (Directory.Exists(stage) && string.Equals(Path.GetDirectoryName(Path.GetFullPath(stage)), Path.GetFullPath(recordingRoot).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase) && Path.GetFileName(stage).StartsWith(".cabinet-stage-", StringComparison.Ordinal))
+                {
+                    try { Directory.Delete(stage, true); }
+                    catch (Exception ex) { log("media: staging cleanup deferred: " + ex.Message); }
+                }
+            }
+        }
     }
 
     // ---------- Playtime ----------
@@ -769,10 +1316,11 @@ namespace Cabinet
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder name, ref int size);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
 
-        class Entry { public double PendingSec; public int InflightMin; public int Expected; public long AppliedAt; public long LastPlayed; }
+        class Entry { public double PendingSec; public int InflightMin; public int Expected; public long AppliedAt; public long LastPlayed; public long PendingCloud, InflightCloud, CreditedCloud; public bool ApplyIntent; }
 
         readonly string path;
         readonly Dictionary<string, Entry> entries = new Dictionary<string, Entry>();
+        readonly HashSet<string> cloudReceipts = new HashSet<string>(StringComparer.Ordinal);
         Dictionary<string, string> gameDirs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // game root -> appid
         DateTime lastScan = DateTime.MinValue, lastTick = DateTime.UtcNow;
         public readonly Action<string> Log;
@@ -860,6 +1408,8 @@ namespace Cabinet
             }
         }
 
+        public void RefreshGames() { ScanGames(); lastScan = DateTime.UtcNow; }
+
         public IEnumerable<string> GameDirs() { return gameDirs.Select(g => g.Value + "  " + g.Key); }
 
         public HashSet<string> RunningApps()
@@ -886,6 +1436,53 @@ namespace Cabinet
             return e;
         }
 
+        // Receipt and pending provenance are committed together; failed writes are retryable.
+        public bool QueueCloudMinutes(string receiptId, string appId, int minutes)
+        {
+            if (string.IsNullOrEmpty(receiptId) || receiptId.IndexOfAny(new[] { '|', '\r', '\n' }) >= 0 ||
+                string.IsNullOrEmpty(appId) || !appId.All(char.IsDigit) || minutes <= 0) return false;
+            if (cloudReceipts.Contains(receiptId)) return true;
+            var e = Get(appId);
+            double before = e.PendingSec; long cloudBefore = e.PendingCloud;
+            try
+            {
+                e.PendingSec += (double)minutes * 60; e.PendingCloud = checked(e.PendingCloud + minutes);
+                cloudReceipts.Add(receiptId); Save(); return true;
+            }
+            catch (Exception ex)
+            {
+                e.PendingSec = before; e.PendingCloud = cloudBefore; cloudReceipts.Remove(receiptId);
+                Log("cloud ledger deferred: " + ex.Message); return false;
+            }
+        }
+
+        public long CloudMinutesInSteam(string appId)
+        {
+            Entry e;
+            return entries.TryGetValue(appId, out e) ? e.CreditedCloud + e.InflightCloud : 0;
+        }
+
+        // Recover an interrupted VDF write before a cloud snapshot can inspect provenance.
+        void RecoverApply(string account) { RecoverApplyConfig(LocalConfig(account)); }
+        void RecoverApplyConfig(string cfg)
+        {
+            if (!entries.Values.Any(e => e.ApplyIntent)) return;
+            if (!File.Exists(cfg)) return;
+            var vdf = new VdfText(File.ReadAllText(cfg, new UTF8Encoding(false)));
+            foreach (var kv in entries.Where(k => k.Value.ApplyIntent))
+            {
+                int current; int.TryParse(vdf.GetAppValue(kv.Key, "Playtime"), out current);
+                var e = kv.Value;
+                if (current < e.Expected)
+                {
+                    e.PendingSec += (double)e.InflightMin * 60; e.PendingCloud += e.InflightCloud;
+                    e.InflightMin = 0; e.InflightCloud = 0;
+                }
+                e.ApplyIntent = false;
+            }
+            Save();
+        }
+
         // Called every few seconds. Returns a message to show the user, or null.
         public string Tick(string account)
         {
@@ -907,6 +1504,7 @@ namespace Cabinet
             string msg = null;
             if (account != null)
             {
+                RecoverApply(account);
                 if (!SteamRunning()) msg = Apply(account);
                 else Verify(account);
             }
@@ -917,12 +1515,14 @@ namespace Cabinet
         // Adds pending minutes to localconfig.vdf. Only call while Steam is closed.
         string Apply(string account)
         {
-            var pending = entries.Where(kv => kv.Value.PendingSec >= 60).ToList();
+            return ApplyConfig(LocalConfig(account), Path.Combine(App.DataDir, "backup", "localconfig_" + account + ".vdf"));
+        }
+        string ApplyConfig(string cfg, string bak)
+        {
+            var pending = entries.Where(kv => kv.Value.PendingSec >= 60 && kv.Value.InflightMin == 0 && !kv.Value.ApplyIntent).ToList();
             if (pending.Count == 0) return null;
-            var cfg = LocalConfig(account);
             if (!File.Exists(cfg)) return null;
 
-            var bak = Path.Combine(App.DataDir, "backup", "localconfig_" + account + ".vdf");
             Directory.CreateDirectory(Path.GetDirectoryName(bak));
             if (!File.Exists(bak)) File.Copy(cfg, bak);
 
@@ -931,32 +1531,46 @@ namespace Cabinet
             foreach (var kv in pending)
             {
                 var e = kv.Value;
-                int minutes = (int)(e.PendingSec / 60);
+                int minutes = (int)Math.Min(int.MaxValue, e.PendingSec / 60);
                 int cur, cur2;
                 int.TryParse(vdf.GetAppValue(kv.Key, "Playtime"), out cur);
                 int.TryParse(vdf.GetAppValue(kv.Key, "Playtime2wks"), out cur2);
                 long lp;
                 long.TryParse(vdf.GetAppValue(kv.Key, "LastPlayed"), out lp);
+                minutes = Math.Min(minutes, int.MaxValue - Math.Max(0, cur));
+                if (minutes <= 0) continue;
                 if (!vdf.SetAppValue(kv.Key, "Playtime", (cur + minutes).ToString())) return null;
-                vdf.SetAppValue(kv.Key, "Playtime2wks", (cur2 + minutes).ToString());
+                vdf.SetAppValue(kv.Key, "Playtime2wks", Math.Min(int.MaxValue, (long)cur2 + minutes).ToString());
                 if (e.LastPlayed > lp) vdf.SetAppValue(kv.Key, "LastPlayed", e.LastPlayed.ToString());
-                e.PendingSec -= minutes * 60;
-                e.InflightMin += minutes;
+                e.PendingSec -= (double)minutes * 60;
+                e.InflightMin = minutes;
+                e.InflightCloud = Math.Min(e.PendingCloud, minutes); e.PendingCloud -= e.InflightCloud;
+                e.ApplyIntent = true;
                 e.Expected = cur + minutes;
                 e.AppliedAt = Unix(DateTime.UtcNow);
                 added.Add(kv.Key + ": +" + FormatMin(minutes));
                 Log("playtime " + kv.Key + ": " + cur + " -> " + (cur + minutes) + " min");
             }
             var tmp = cfg + ".tmp";
-            File.WriteAllText(tmp, vdf.Text, new UTF8Encoding(false));
-            File.Replace(tmp, cfg, null);
+            // Persist intent first: a crash on either side of the VDF replacement is recoverable.
+            try
+            {
+                Save();
+                if (SteamRunning()) throw new IOException("Steam restarted during playtime preparation");
+                File.WriteAllText(tmp, vdf.Text, new UTF8Encoding(false));
+                if (SteamRunning()) throw new IOException("Steam restarted before playtime commit");
+                File.Replace(tmp, cfg, null);
+            }
+            catch { RecoverApplyConfig(cfg); throw; }
+            foreach (var kv in pending) kv.Value.ApplyIntent = false;
+            Save();
             return L.T("Playtime added (shows when Steam starts):\n", "Temps de jeu ajouté (visible au démarrage de Steam) :\n") + string.Join("\n", added);
         }
 
         // After Steam has restarted and saved its config, make sure our minutes survived; re-queue if not.
-        void Verify(string account)
+        void Verify(string account) { VerifyConfig(LocalConfig(account)); }
+        void VerifyConfig(string cfg)
         {
-            var cfg = LocalConfig(account);
             if (!File.Exists(cfg)) return;
             long mtime = Unix(File.GetLastWriteTimeUtc(cfg));
             VdfText vdf = null;
@@ -967,13 +1581,14 @@ namespace Cabinet
                 if (vdf == null) vdf = new VdfText(File.ReadAllText(cfg, new UTF8Encoding(false)));
                 int cur;
                 int.TryParse(vdf.GetAppValue(kv.Key, "Playtime"), out cur);
-                if (cur < e.Expected) { e.PendingSec += e.InflightMin * 60; Log("playtime " + kv.Key + ": Steam dropped " + e.InflightMin + " min, re-queued"); }
-                e.InflightMin = 0;
+                if (cur < e.Expected) { e.PendingSec += (double)e.InflightMin * 60; e.PendingCloud += e.InflightCloud; Log("playtime " + kv.Key + ": Steam dropped " + e.InflightMin + " min, re-queued"); }
+                else e.CreditedCloud += e.InflightCloud;
+                e.InflightMin = 0; e.InflightCloud = 0;
                 Save();
             }
         }
 
-        public int PendingMinutes() { return (int)(entries.Values.Sum(e => e.PendingSec) / 60); }
+        public int PendingMinutes() { return (int)Math.Min(int.MaxValue, entries.Values.Sum(e => e.PendingSec) / 60); }
 
         public static string FormatMin(int m) { return m >= 60 ? (m / 60) + "h " + (m % 60) + "m" : m + "m"; }
 
@@ -983,6 +1598,7 @@ namespace Cabinet
             foreach (var l in File.ReadAllLines(path))
             {
                 var p = l.Split('|');
+                if (p.Length == 2 && p[0] == "#cloud-receipt") { cloudReceipts.Add(p[1]); continue; }
                 if (p.Length < 6) continue;
                 entries[p[0]] = new Entry
                 {
@@ -990,16 +1606,23 @@ namespace Cabinet
                     InflightMin = int.Parse(p[2]),
                     Expected = int.Parse(p[3]),
                     AppliedAt = long.Parse(p[4]),
-                    LastPlayed = long.Parse(p[5])
+                    LastPlayed = long.Parse(p[5]),
+                    PendingCloud = p.Length > 6 ? long.Parse(p[6]) : 0,
+                    InflightCloud = p.Length > 7 ? long.Parse(p[7]) : 0,
+                    CreditedCloud = p.Length > 8 ? long.Parse(p[8]) : 0,
+                    ApplyIntent = p.Length > 9 && p[9] == "1"
                 };
             }
         }
 
         void Save()
         {
-            File.WriteAllLines(path, entries.Select(kv => string.Join("|", kv.Key,
+            var lines = entries.Select(kv => string.Join("|", kv.Key,
                 kv.Value.PendingSec.ToString(CultureInfo.InvariantCulture), kv.Value.InflightMin, kv.Value.Expected,
-                kv.Value.AppliedAt, kv.Value.LastPlayed)).ToArray());
+                kv.Value.AppliedAt, kv.Value.LastPlayed, kv.Value.PendingCloud, kv.Value.InflightCloud,
+                kv.Value.CreditedCloud, kv.Value.ApplyIntent ? "1" : "0"))
+                .Concat(cloudReceipts.Select(r => "#cloud-receipt|" + r));
+            WorkshopEngine.AtomicWrite(path, string.Join(Environment.NewLine, lines) + Environment.NewLine);
         }
     }
 
@@ -1118,6 +1741,7 @@ namespace Cabinet
         readonly Playtime playtime;
         readonly Shadows shadows;
         readonly SchemaFill schemas;
+        readonly SessionMedia media;
         readonly Dictionary<string, string> syncTimes = new Dictionary<string, string>();
         DateTime nextUpdate = DateTime.UtcNow.AddMinutes(1);
         bool checkingUpdate, manualUpdate;
@@ -1136,12 +1760,16 @@ namespace Cabinet
             playtime = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log);
             shadows = new Shadows(Log);
             schemas = new SchemaFill(Log);
+            media = new SessionMedia(Log);
+            CloudSync.Configure(Log, playtime.QueueCloudMinutes, playtime.CloudMinutesInSteam, delegate { return playtime.RunningApps(); });
+            WorkshopLinker.Initialize(Log);
             using (var stream = typeof(App).Assembly.GetManifestResourceStream("Cabinet.Icon"))
                 trayIcon = new Icon(stream, SystemInformation.SmallIconSize);
             tray = new NotifyIcon { Icon = trayIcon, Text = "Cabinet", Visible = true };
             var menu = new ContextMenuStrip();
             var games = new ToolStripMenuItem(L.T("Games", "Jeux"));
             menu.Items.Add(games);
+            menu.Items.Add(CloudSync.MenuItem());
             menu.Opening += delegate { PopulateGames(games); };
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(L.T("Sync now", "Synchroniser"), null, delegate { Tick(true); });
@@ -1159,17 +1787,30 @@ namespace Cabinet
 
         void Tick(bool force)
         {
+            // One balloon per tick; additional events wait for the next tick.
+            try { TickCore(force); }
+            finally { ShowNextBalloon(); }
+        }
+
+        void TickCore(bool force)
+        {
             // Count before launching/stopping helpers; Running=1 excludes native Steam time.
             try
             {
                 var account = Syncer.AccountId();
                 var msg = playtime.Tick(account);
                 var running = playtime.RunningApps();
+                var workshopMsg = WorkshopLinker.Tick(running);
+                if (workshopMsg != null) QueueBalloon(workshopMsg);
+                try { media.Tick(running, account); }
+                catch (Exception ex) { Log("media error: " + ex.Message); }
                 var schemaMsg = schemas.Tick(running.Count > 0 || shadows.HasChildren, checkingUpdate || updateDownload != null);
                 foreach (var id in shadows.Tick(running, account)) state.Remove(id);
+                var cloudMsg = CloudSync.Tick(running.Count > 0 || shadows.HasChildren || schemas.HasChild || Shadows.AnyHelper(), running);
+                if (cloudMsg != null) QueueBalloon(cloudMsg);
                 UpdateTick(running.Count > 0);
-                if (schemaMsg != null) tray.ShowBalloonTip(5000, "Cabinet", schemaMsg, ToolTipIcon.Info);
-                if (msg != null) tray.ShowBalloonTip(5000, "Cabinet", msg, ToolTipIcon.Info);
+                if (schemaMsg != null) QueueBalloon(schemaMsg);
+                if (msg != null) QueueBalloon(msg);
                 int pend = playtime.PendingMinutes();
                 tray.Text = pend > 0 ? "Cabinet - " + Playtime.FormatMin(pend) + L.T(" pending", " en attente") : "Cabinet";
             }
@@ -1203,12 +1844,19 @@ namespace Cabinet
                 SaveState();
                 File.WriteAllLines(SyncTimesPath, syncTimes.Select(kv => kv.Key + "|" + kv.Value).ToArray());
                 if (synced.Count > 0)
-                    tray.ShowBalloonTip(5000, L.T("Achievements synced to Steam", "Succès synchronisés avec Steam"), string.Join("\n", synced), ToolTipIcon.Info);
+                    QueueBalloon(L.T("Achievements synced to Steam", "Succès synchronisés avec Steam") + "\n" + string.Join("\n", synced));
                 else if (force)
-                    tray.ShowBalloonTip(3000, "Cabinet", L.T("Everything is already in sync.", "Tout est déjà synchronisé."), ToolTipIcon.Info);
+                    QueueBalloon(L.T("Everything is already in sync.", "Tout est déjà synchronisé."));
             }
             catch (Exception ex) { Log("error: " + ex.Message); }
 
+        }
+
+        readonly Queue<string> balloons = new Queue<string>();
+        void QueueBalloon(string message) { if (!balloons.Contains(message)) balloons.Enqueue(message); }
+        void ShowNextBalloon()
+        {
+            if (balloons.Count > 0) tray.ShowBalloonTip(5000, L.T("Cabinet", "Cabinet"), balloons.Dequeue(), ToolTipIcon.Info);
         }
 
         protected override void Dispose(bool disposing)
@@ -1436,11 +2084,11 @@ namespace Cabinet
         void CheckUpdates(bool manual)
         {
             if (checkingUpdate) { if (manual) manualUpdate = true; return; }
-            if (updateDownload != null) { if (manual) tray.ShowBalloonTip(3000, "Cabinet", L.T("Update ready; waiting until games finish.", "Mise à jour prête ; installation après la fin des parties."), ToolTipIcon.Info); return; }
+            if (updateDownload != null) { if (manual) QueueBalloon(L.T("Update ready; waiting until games finish.", "Mise à jour prête ; installation après la fin des parties.")); return; }
             if (shadows.HasChildren || schemas.HasChild || Shadows.AnyHelper() || playtime.RunningApps().Count > 0)
             {
                 manualUpdate |= manual; nextUpdate = DateTime.UtcNow.AddSeconds(30);
-                if (manual) tray.ShowBalloonTip(3000, "Cabinet", L.T("Update check deferred until games finish.", "Vérification reportée à la fin des parties."), ToolTipIcon.Info);
+                if (manual) QueueBalloon(L.T("Update check deferred until games finish.", "Vérification reportée à la fin des parties."));
                 return;
             }
             manualUpdate |= manual; checkingUpdate = true; nextUpdate = DateTime.UtcNow.AddHours(24);
@@ -1462,7 +2110,7 @@ namespace Cabinet
             if (updateFinished)
             {
                 updateFinished = false; checkingUpdate = false;
-                if (manualUpdate && updateMessage != null) tray.ShowBalloonTip(5000, "Cabinet", updateMessage, ToolTipIcon.Info);
+                if (manualUpdate && updateMessage != null) QueueBalloon(updateMessage);
                 manualUpdate = false;
             }
             if (updateDownload != null && !checkingUpdate && !playing && !shadows.HasChildren && !schemas.HasChild && !Shadows.AnyHelper())
@@ -1496,6 +2144,70 @@ namespace Cabinet
             catch (InvalidOperationException) { return false; }
         }
 
+        // SteamAppId is cached process-wide by steamclient: the 480 reader must
+        // be a separate process. It only reads; it never joins or creates a lobby.
+        sealed class PresenceRelay : IDisposable
+        {
+            public readonly string Path;
+            readonly EventWaitHandle stop;
+            readonly Process process;
+            public PresenceRelay(Action<string> logger)
+            {
+                string token = Guid.NewGuid().ToString("N"), name = "Local\\Cabinet-presence-" + token;
+                Directory.CreateDirectory(DataDir);
+                Path = System.IO.Path.Combine(DataDir, "presence-" + token + ".json");
+                stop = new EventWaitHandle(false, EventResetMode.ManualReset, name);
+                try
+                {
+                    using (var parent = Process.GetCurrentProcess())
+                    {
+                        var info = new ProcessStartInfo(Application.ExecutablePath, "--presence-source " + parent.Id + " " + parent.StartTime.ToUniversalTime().Ticks + " " + name + " \"" + Path + "\"");
+                        info.UseShellExecute = false; info.CreateNoWindow = true; info.WindowStyle = ProcessWindowStyle.Hidden;
+                        process = Process.Start(info);
+                    }
+                    var until = DateTime.UtcNow.AddSeconds(5);
+                    while (!File.Exists(Path) && !process.HasExited && DateTime.UtcNow < until) Thread.Sleep(50);
+                    if (!File.Exists(Path)) throw new IOException("480 reader did not become ready");
+                    logger("shadow: read-only 480 presence relay ready");
+                }
+                catch { Dispose(); throw; }
+            }
+            public void Dispose()
+            {
+                stop.Set();
+                if (process != null)
+                {
+                    try { if (!process.WaitForExit(3000)) { process.Kill(); process.WaitForExit(1000); } } catch { }
+                    process.Dispose();
+                }
+                stop.Dispose();
+                try { File.Delete(Path); File.Delete(Path + ".tmp"); } catch { }
+            }
+        }
+        static void RunPresenceSource(string[] args)
+        {
+            SetErrorMode(0x0001 | 0x0002 | 0x8000);
+            int parent = int.Parse(args[1]); long started = long.Parse(args[2]);
+            try
+            {
+            using (var stop = EventWaitHandle.OpenExisting(args[3]))
+            {
+            if (!ParentAlive(parent, started) || !Playtime.SteamRunning() || stop.WaitOne(0)) return;
+            using (var session = new SteamSession("480", Log))
+            {
+                while (ParentAlive(parent, started) && Playtime.SteamRunning() && !stop.WaitOne(0))
+                {
+                    session.Pump();
+                    File.WriteAllText(args[4] + ".tmp", session.PresenceSnapshot(), new UTF8Encoding(false));
+                    if (File.Exists(args[4])) File.Replace(args[4] + ".tmp", args[4], null); else File.Move(args[4] + ".tmp", args[4]);
+                    stop.WaitOne(1000);
+                }
+            }
+            }
+            }
+            finally { try { File.Delete(args[4]); File.Delete(args[4] + ".tmp"); } catch { } }
+        }
+
         static void RunShadow(string[] args)
         {
             // All Steam environment variables are confined to this process. No game DLLs,
@@ -1515,11 +2227,18 @@ namespace Cabinet
                     var account = Syncer.AccountId();
                     if (account == null) return;
                     Syncer.BackupSteamFiles(id, account);
+                    PresenceRelay source = null;
+                    try { source = new PresenceRelay(Log); }
+                    catch (Exception ex) { Log("shadow " + id + ": 480 presence reader unavailable: " + ex.Message); }
+                    using (source)
                     using (var session = new SteamSession(id, Log))
                     {
+                        var detector = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log);
+                        detector.RefreshGames();
                         while (ParentAlive(parent, started) && Playtime.SteamRunning() && !stop.WaitOne(0))
                         {
                             session.Pump();
+                            session.MirrorJoin(source != null && detector.RunningApps().SetEquals(new[] { id }) ? source.Path : null);
                             try { session.Sync(false); }
                             catch (IOException ex) { Log("shadow " + id + ": retry reading stats: " + ex.Message); }
                             if (stop.WaitOne(1000)) break;
@@ -1585,6 +2304,7 @@ namespace Cabinet
             if (!string.Equals(Path.GetFullPath(self), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase))
                 File.Copy(self, target, true);
             using (var k = Registry.CurrentUser.CreateSubKey(RunKey)) k.SetValue("Cabinet", "\"" + target + "\"");
+            CloudSync.RegisterProtocol(target);
             return target;
         }
 
@@ -1600,6 +2320,34 @@ namespace Cabinet
         [STAThread]
         static void Main(string[] args)
         {
+            if (CloudSync.HandleArgs(args)) return;
+            if (args.Length > 0 && args[0] == "--workshop") { WorkshopLinker.RunCli(args); return; }
+            if (args.Length == 4 && args[0] == "--join-probe")
+            {
+                try
+                {
+                    if (args[2] == "mirror")
+                    {
+                        using (var source = new PresenceRelay(Console.WriteLine))
+                        using (var session = new SteamSession(args[1], Console.WriteLine)) session.MirrorProbe(source.Path, int.Parse(args[3]));
+                    }
+                    else using (var session = new SteamSession(args[1], Console.WriteLine)) session.JoinProbe(args[2] == "producer", int.Parse(args[3]));
+                }
+                catch (Exception ex) { Console.WriteLine(ex); Environment.ExitCode = 1; }
+                return;
+            }
+            if (args.Length == 5 && args[0] == "--presence-source")
+            {
+                try { RunPresenceSource(args); }
+                catch (Exception ex) { Log("presence source failed: " + ex.Message); Environment.ExitCode = 1; }
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--capture-probe")
+            {
+                try { using (var session = new SteamSession(args[1], Console.WriteLine)) session.CaptureProbe(); }
+                catch (Exception ex) { Console.WriteLine(ex); Environment.ExitCode = 1; }
+                return;
+            }
             if (args.Length == 1 && args[0] == "--version") { Console.WriteLine(BuildInfo.Version); return; }
             if (args.Length == 1 && args[0] == "--games")
             {
@@ -1628,7 +2376,7 @@ namespace Cabinet
             }
             if (args.Length == 2 && args[0] == "--schema-test")
             {
-                var pt = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log); pt.Tick(null);
+                var pt = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log); pt.RefreshGames();
                 if (pt.RunningApps().Count > 0 || Shadows.AnyHelper()) { Console.WriteLine("Schema request deferred: a game/helper is active."); return; }
                 SchemaFill.Fetch(args[1], delegate { return pt.RunningApps().Count > 0; }, Console.WriteLine);
                 return;
@@ -1694,7 +2442,7 @@ namespace Cabinet
             if (args.Length == 1 && args[0] == "--running")   // console/debug: which OnlineFix games are running now
             {
                 var pt = new Playtime(Path.Combine(Path.GetTempPath(), "as_pt_test.txt"), Console.WriteLine);
-                pt.Tick(null);
+                pt.RefreshGames();
                 foreach (var g in pt.GameDirs()) Console.WriteLine(g);
                 Console.WriteLine("running: " + string.Join(", ", pt.RunningApps()));
                 return;
@@ -1703,7 +2451,7 @@ namespace Cabinet
             var installed = Path.Combine(DataDir, "Cabinet.exe");
             if (!string.Equals(Path.GetFullPath(Application.ExecutablePath), Path.GetFullPath(installed), StringComparison.OrdinalIgnoreCase))
             {
-                var detector = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log); detector.Tick(null);
+                var detector = new Playtime(Path.Combine(DataDir, "playtime.txt"), Log); detector.RefreshGames();
                 if (Shadows.AnyHelper() || detector.RunningApps().Count > 0) { Log("installation deferred: a game/shadow helper is active"); return; }
                 // Run from the download/build location: stop any installed copy, install this build, hand over.
                 foreach (var p in Process.GetProcessesByName("Cabinet"))
