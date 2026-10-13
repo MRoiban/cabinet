@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -30,7 +30,7 @@ if(friend){var p=friend.persona,original=p.m_strGameExtraInfo,game=p.m_gameid;
  s.labels={};s.apply();result.labelCleared=p.m_strGameExtraInfo===original&&p.m_gameid===game;
 }
 }finally{
-var s=window.__cabinetLabels;if(s){s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);s.patches.forEach(function(m,p){Object.keys(m).forEach(function(n){if(p[n]===m[n].wrapped)p[n]=m[n].original;});});delete window.__cabinetLabels;}
+var s=window.__cabinetLabels;if(s){s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);s.patches.forEach(function(m,p){Object.keys(m).forEach(function(n){if(p[n]===m[n].wrapped)p[n]=m[n].original;});});if(s.spacewarInfo)delete s.spacewarInfo.icon_url;delete window.__cabinetLabels;}
 }
 result.restored=before.every(function(v){return v.p.m_strGameExtraInfo===v.name&&v.p.m_unGamePlayedAppID===v.app&&v.p.m_gameid===v.game;});result.stateRemoved=!window.__cabinetLabels;
 return result;
@@ -62,20 +62,21 @@ return result;
             string mock = @"
 const assert=require('node:assert/strict');
 global.window=global;let timers=[];global.setInterval=(fn)=>{timers.push(fn);return 1;};
+class AppInfo {constructor(id){this.m_unAppID=id;} get icon_url(){return 'icon-app-'+this.m_unAppID;}}
 class Persona {constructor(app,name){this.m_unGamePlayedAppID=app;this.m_gameid=String(app);this.m_strGameExtraInfo=name;} UpdateFromMessage(app,name){this.m_unGamePlayedAppID=app;this.m_gameid=String(app);this.m_strGameExtraInfo=name;return 42;} GetCurrentGameIconURL(){return 'icon-'+this.m_unGamePlayedAppID;}}
 let p=new Persona(480,'Spacewar'),other=new Persona(100,'Other'),self=new Persona(480,'Self');
-global.g_FriendsUIApp={FriendStore:{all_friends:new Set([{accountid:123,persona:p},{accountid:456,persona:other}]),self:{persona:self}},AppInfoStore:{GetAppInfo:(id)=>({icon_url:'real-icon-'+id})}};
+global.g_FriendsUIApp={FriendStore:{all_friends:new Set([{accountid:123,persona:p},{accountid:456,persona:other}]),self:{persona:self}},AppInfoStore:{cache:new Map(),GetAppInfo(id){if(!this.cache.has(id))this.cache.set(id,new AppInfo(id));return this.cache.get(id);}}};
 const original=Persona.prototype.UpdateFromMessage;
 ";
             string behavior = @"
 const patched=Persona.prototype.UpdateFromMessage;
 assert.notEqual(original,patched);assert.equal(p.m_strGameExtraInfo,'quoted '+String.fromCharCode(34)+' '+String.fromCharCode(92)+' </script> é ☃');assert.equal(p.m_unGamePlayedAppID,480);assert.equal(other.m_strGameExtraInfo,'Other');assert.equal(self.m_strGameExtraInfo,'Self');
-assert.equal(p.m_gameid,'2868840');assert.equal(p.GetCurrentGameIconURL(),'real-icon-2868840');assert.equal(other.GetCurrentGameIconURL(),'icon-100');assert.equal(other.m_gameid,'100');
+assert.equal(p.m_gameid,'2868840');assert.equal(p.GetCurrentGameIconURL(),'icon-app-2868840');assert.equal(g_FriendsUIApp.AppInfoStore.GetAppInfo(480).icon_url,'icon-app-2868840');assert.equal(other.GetCurrentGameIconURL(),'icon-100');assert.equal(other.m_gameid,'100');
 assert.equal(p.UpdateFromMessage(480,'Server name'),42);assert.equal(p.m_strGameExtraInfo,__cabinetLabels.labels['123'].name);assert.equal(p.m_gameid,'2868840');
 ";
             string tail = @"
 assert.equal(Persona.prototype.UpdateFromMessage,patched);assert.equal(timers.length,1);
-__cabinetLabels.labels={};__cabinetLabels.apply();assert.equal(p.m_strGameExtraInfo,'Server name');assert.equal(p.m_gameid,'480');assert.equal(p.GetCurrentGameIconURL(),'icon-480');
+__cabinetLabels.labels={};__cabinetLabels.apply();assert.equal(p.m_strGameExtraInfo,'Server name');assert.equal(p.m_gameid,'480');assert.equal(p.GetCurrentGameIconURL(),'icon-480');assert.equal(g_FriendsUIApp.AppInfoStore.GetAppInfo(480).icon_url,'icon-app-480');
 __cabinetLabels.labels={'123':{name:'New',app:'2868840'}};__cabinetLabels.apply();p.UpdateFromMessage(100,'Real Steam game');assert.equal(p.m_strGameExtraInfo,'Real Steam game');assert.equal(p.m_gameid,'100');
 p.UpdateFromMessage(480,'Server again');assert.equal(p.m_strGameExtraInfo,'New');p.m_strGameExtraInfo='External';p.m_gameid='999';__cabinetLabels.labels={};__cabinetLabels.apply();assert.equal(p.m_strGameExtraInfo,'External');assert.equal(p.m_gameid,'999');
 __cabinetLabels.labels={'123':{name:'Expiry',app:'2868840'}};__cabinetLabels.apply();__cabinetLabels.expires=0;timers[0]();assert.equal(p.m_strGameExtraInfo,'External');assert.equal(p.m_gameid,'999');
@@ -89,7 +90,7 @@ const v1=function(){};global.__cabinetLabels={labels:{},written:new Map([[q,{}]]
 Persona.prototype.UpdateFromMessage=v1;let cleared=0;global.clearInterval=()=>{cleared++;};
 ";
             string upgradeCheck = @"
-assert.equal(__cabinetLabels.version,2);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
+assert.equal(__cabinetLabels.version,3);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
 console.log('PASS older injected script replaced');
 ";
             File.WriteAllText(path, mock + script + ";\n" + behavior + script + ";\n" + tail + upgrade + script + ";\n" + upgradeCheck);

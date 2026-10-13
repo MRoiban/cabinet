@@ -143,17 +143,31 @@ namespace Cabinet
             // Only serialized data enters the script. App 480, the lobby and the connect
             // string stay intact so Join Game still works. The game id is what Launch Game
             // runs, so it points at the real game; the icon comes from the real game too.
-            return @"(function(labels){
+            // Avatar badges read app 480's icon directly, not the friend's: Spacewar's
+            // icon (broken anyway) becomes the shared real game's, else Cabinet's own.
+            return @"(function(labels,fallback){
 var store=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
 if(!store)throw new Error('Cabinet: friends store unavailable');
 var s=window.__cabinetLabels;
-if(s&&s.version!==2){
+if(s&&s.version!==3){
  s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);
- s.patches.forEach(function(v,p){if(p.UpdateFromMessage===v.wrapped)p.UpdateFromMessage=v.original;});
+ s.patches.forEach(function(v,p){if(v.wrapped){if(p.UpdateFromMessage===v.wrapped)p.UpdateFromMessage=v.original;}
+  else Object.keys(v).forEach(function(n){if(p[n]===v[n].wrapped)p[n]=v[n].original;});});
+ if(s.spacewarInfo)delete s.spacewarInfo.icon_url;
  s=null;
 }
 if(!s){
- s=window.__cabinetLabels={version:2,labels:{},written:new Map(),patches:new Map(),expires:0};
+ s=window.__cabinetLabels={version:3,labels:{},written:new Map(),patches:new Map(),expires:0,fallback:''};
+ s.spacewarIcon=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore,current=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
+  if(!apps||!current)return null;
+  var games=new Set(),unknown=false;
+  Array.from(current.all_friends).forEach(function(f){var p=f.persona;if(!p||p.m_unGamePlayedAppID!==480)return;
+   var v=s.written.get(p);if(v&&p.m_gameid===v.app)games.add(v.app);else unknown=true;});
+  if(games.size===1&&!unknown){var info=apps.GetAppInfo(Number(games.values().next().value));if(info&&info.m_unAppID!==480&&info.icon_url)return info.icon_url;}
+  return s.fallback||null;};
+ s.patchSpacewar=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore;if(!apps||s.spacewarInfo)return;
+  var a=apps.GetAppInfo(480),d=a&&Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'icon_url');if(!d||!d.get)return;
+  Object.defineProperty(a,'icon_url',{configurable:true,get:function(){return s.spacewarIcon()||d.get.call(this);}});s.spacewarInfo=a;};
  s.clear=function(p){var v=s.written.get(p);if(!v)return;
   if(p.m_strGameExtraInfo===v.name)p.m_strGameExtraInfo=v.beforeName;
   if(p.m_gameid===v.app)p.m_gameid=v.beforeGame;
@@ -183,11 +197,23 @@ if(!s){
    }
    s.one(p,f.accountid);
   });
+  s.patchSpacewar();
  };
  s.timer=setInterval(s.apply,5000);
 }
-s.labels=labels;s.expires=Date.now()+180000;s.apply();return true;
-})(" + new JavaScriptSerializer().Serialize(labels) + ")";
+s.fallback=fallback;s.labels=labels;s.expires=Date.now()+180000;s.apply();return true;
+})(" + new JavaScriptSerializer().Serialize(labels) + "," + new JavaScriptSerializer().Serialize(FallbackIcon()) + ")";
+        }
+        static string fallbackIcon;
+        internal static string FallbackIcon()
+        {
+            if (fallbackIcon != null) return fallbackIcon;
+            using (var stream = typeof(FriendLabels).Assembly.GetManifestResourceStream("Cabinet.Icon32"))
+            {
+                if (stream == null) return fallbackIcon = "";
+                var bytes = new byte[stream.Length]; stream.Read(bytes, 0, bytes.Length);
+                return fallbackIcon = "data:image/png;base64," + Convert.ToBase64String(bytes);
+            }
         }
         internal static Uri SelectTarget(string json)
         {
