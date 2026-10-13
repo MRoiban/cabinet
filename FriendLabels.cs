@@ -149,15 +149,16 @@ namespace Cabinet
 var store=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
 if(!store)throw new Error('Cabinet: friends store unavailable');
 var s=window.__cabinetLabels;
-if(s&&s.version!==3){
+if(s&&s.version!==4){
  s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);
  s.patches.forEach(function(v,p){if(v.wrapped){if(p.UpdateFromMessage===v.wrapped)p.UpdateFromMessage=v.original;}
   else Object.keys(v).forEach(function(n){if(p[n]===v[n].wrapped)p[n]=v[n].original;});});
- if(s.spacewarInfo)delete s.spacewarInfo.icon_url;
+ var w=s.spacewarInfo;
+ if(w&&w.copy){if(w.map.get(480)===w.copy)w.map.set(480,w.original);}else if(w)delete w.icon_url;
  s=null;
 }
 if(!s){
- s=window.__cabinetLabels={version:3,labels:{},written:new Map(),patches:new Map(),expires:0,fallback:''};
+ s=window.__cabinetLabels={version:4,labels:{},written:new Map(),patches:new Map(),expires:0,fallback:''};
  s.spacewarIcon=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore,current=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
   if(!apps||!current)return null;
   var games=new Set(),unknown=false;
@@ -165,9 +166,15 @@ if(!s){
    var v=s.written.get(p);if(v&&p.m_gameid===v.app)games.add(v.app);else unknown=true;});
   if(games.size===1&&!unknown){var info=apps.GetAppInfo(Number(games.values().next().value));if(info&&info.m_unAppID!==480&&info.icon_url)return info.icon_url;}
   return s.fallback||null;};
- s.patchSpacewar=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore;if(!apps||s.spacewarInfo)return;
-  var a=apps.GetAppInfo(480),d=a&&Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'icon_url');if(!d||!d.get)return;
-  Object.defineProperty(a,'icon_url',{configurable:true,get:function(){return s.spacewarIcon()||d.get.call(this);}});s.spacewarInfo=a;};
+ // AppInfo objects aren't observable; the store's map is. Swapping in a copy with the
+ // icon override makes rendered badges refresh; restoring the original undoes it.
+ s.patchSpacewar=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore,map=apps&&apps.m_mapAppInfo;
+  if(!map||typeof map.set!=='function')return;apps.GetAppInfo(480);var a=map.get(480);
+  if(!a||(s.spacewarInfo&&a===s.spacewarInfo.copy))return;
+  var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'icon_url');if(!d||!d.get)return;
+  var c=Object.create(Object.getPrototypeOf(a));Object.getOwnPropertyNames(a).forEach(function(k){c[k]=a[k];});
+  Object.defineProperty(c,'icon_url',{configurable:true,get:function(){return s.spacewarIcon()||d.get.call(this);}});
+  s.spacewarInfo={map:map,original:a,copy:c};map.set(480,c);};
  s.clear=function(p){var v=s.written.get(p);if(!v)return;
   if(p.m_strGameExtraInfo===v.name)p.m_strGameExtraInfo=v.beforeName;
   if(p.m_gameid===v.app)p.m_gameid=v.beforeGame;

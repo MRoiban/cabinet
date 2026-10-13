@@ -30,7 +30,7 @@ if(friend){var p=friend.persona,original=p.m_strGameExtraInfo,game=p.m_gameid;
  s.labels={};s.apply();result.labelCleared=p.m_strGameExtraInfo===original&&p.m_gameid===game;
 }
 }finally{
-var s=window.__cabinetLabels;if(s){s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);s.patches.forEach(function(m,p){Object.keys(m).forEach(function(n){if(p[n]===m[n].wrapped)p[n]=m[n].original;});});if(s.spacewarInfo)delete s.spacewarInfo.icon_url;delete window.__cabinetLabels;}
+var s=window.__cabinetLabels;if(s){s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);s.patches.forEach(function(m,p){Object.keys(m).forEach(function(n){if(p[n]===m[n].wrapped)p[n]=m[n].original;});});var w=s.spacewarInfo;if(w&&w.map.get(480)===w.copy)w.map.set(480,w.original);delete window.__cabinetLabels;}
 }
 result.restored=before.every(function(v){return v.p.m_strGameExtraInfo===v.name&&v.p.m_unGamePlayedAppID===v.app&&v.p.m_gameid===v.game;});result.stateRemoved=!window.__cabinetLabels;
 return result;
@@ -65,7 +65,7 @@ global.window=global;let timers=[];global.setInterval=(fn)=>{timers.push(fn);ret
 class AppInfo {constructor(id){this.m_unAppID=id;} get icon_url(){return 'icon-app-'+this.m_unAppID;}}
 class Persona {constructor(app,name){this.m_unGamePlayedAppID=app;this.m_gameid=String(app);this.m_strGameExtraInfo=name;} UpdateFromMessage(app,name){this.m_unGamePlayedAppID=app;this.m_gameid=String(app);this.m_strGameExtraInfo=name;return 42;} GetCurrentGameIconURL(){return 'icon-'+this.m_unGamePlayedAppID;}}
 let p=new Persona(480,'Spacewar'),other=new Persona(100,'Other'),self=new Persona(480,'Self');
-global.g_FriendsUIApp={FriendStore:{all_friends:new Set([{accountid:123,persona:p},{accountid:456,persona:other}]),self:{persona:self}},AppInfoStore:{cache:new Map(),GetAppInfo(id){if(!this.cache.has(id))this.cache.set(id,new AppInfo(id));return this.cache.get(id);}}};
+global.g_FriendsUIApp={FriendStore:{all_friends:new Set([{accountid:123,persona:p},{accountid:456,persona:other}]),self:{persona:self}},AppInfoStore:{m_mapAppInfo:new Map(),GetAppInfo(id){if(!this.m_mapAppInfo.has(id))this.m_mapAppInfo.set(id,new AppInfo(id));return this.m_mapAppInfo.get(id);}}};const spacewarOriginal=g_FriendsUIApp.AppInfoStore.GetAppInfo(480);
 const original=Persona.prototype.UpdateFromMessage;
 ";
             string behavior = @"
@@ -90,8 +90,9 @@ const v1=function(){};global.__cabinetLabels={labels:{},written:new Map([[q,{}]]
 Persona.prototype.UpdateFromMessage=v1;let cleared=0;global.clearInterval=()=>{cleared++;};
 ";
             string upgradeCheck = @"
-assert.equal(__cabinetLabels.version,3);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
-console.log('PASS older injected script replaced');
+assert.equal(__cabinetLabels.version,4);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
+assert.notEqual(g_FriendsUIApp.AppInfoStore.m_mapAppInfo.get(480),spacewarOriginal);assert.equal(spacewarOriginal.icon_url,'icon-app-480');
+console.log('PASS older injected script replaced; Spacewar entry swapped, original untouched');
 ";
             File.WriteAllText(path, mock + script + ";\n" + behavior + script + ";\n" + tail + upgrade + script + ";\n" + upgradeCheck);
             using (var process = Process.Start(new ProcessStartInfo("bun", "\"" + path + "\"") { UseShellExecute = false, CreateNoWindow = true }))
