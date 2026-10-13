@@ -1,4 +1,4 @@
-name: Build and release
+﻿name: Build and release
 
 # Every push to main builds Cabinet.exe and publishes it as the latest release.
 on:
@@ -15,7 +15,7 @@ jobs:
     env:
       CABINET_VERSION: 1.0.${{ github.run_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build
         shell: cmd
