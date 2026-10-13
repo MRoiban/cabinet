@@ -106,8 +106,10 @@ namespace Cabinet
                     var labels = new Dictionary<string, Label>();
                     if (connected)
                     {
+                        // A failed fetch keeps the labels already in Steam (they expire on their own)
+                        // instead of wiping them until the next successful round.
                         try { labels = ReadPlayers(request("GET", "/api/presence", null), own); }
-                        catch (Exception ex) { Once(log, "presence fetch failed", ex); }
+                        catch (Exception ex) { Once(log, "presence fetch failed", ex); return; }
                     }
                     if (connected || installed)
                     {
@@ -149,16 +151,40 @@ namespace Cabinet
 var store=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
 if(!store)throw new Error('Cabinet: friends store unavailable');
 var s=window.__cabinetLabels;
-if(s&&s.version!==4){
+if(s&&s.version!==5){
  s.labels={};s.written.forEach(function(v,p){s.clear(p);});clearInterval(s.timer);
  s.patches.forEach(function(v,p){if(v.wrapped){if(p.UpdateFromMessage===v.wrapped)p.UpdateFromMessage=v.original;}
   else Object.keys(v).forEach(function(n){if(p[n]===v[n].wrapped)p[n]=v[n].original;});});
  var w=s.spacewarInfo;
  if(w&&w.copy){if(w.map.get(480)===w.copy)w.map.set(480,w.original);}else if(w)delete w.icon_url;
+ if(s.groupStore){var gs=s.groupStore.store;delete gs.GetGameGroup;delete gs.GetCountFriendsInGame;delete gs.games_with_friends_playing;}
  s=null;
 }
 if(!s){
- s=window.__cabinetLabels={version:4,labels:{},written:new Map(),patches:new Map(),expires:0,fallback:''};
+ s=window.__cabinetLabels={version:5,labels:{},written:new Map(),patches:new Map(),expires:0,fallback:'',sig:''};
+ // Friends relabeled to a game in this library are counted under that game (library
+ // page, green badge, home carousel) instead of Spacewar. Not in the library: Spacewar.
+ s.owned=function(app){var st=window.appStore;try{return !!(st&&st.GetAppOverviewByAppID&&st.GetAppOverviewByAppID(Number(app)));}catch(e){return false;}};
+ s.moved=function(){var by={};s.written.forEach(function(v,p){
+   if(v.friend&&p.m_unGamePlayedAppID===480&&p.m_gameid===v.app&&s.owned(v.app))(by[v.app]=by[v.app]||[]).push(v.friend);});return by;};
+ s.group=function(list){return {member_list:list,member_list_unsorted:list,unfiltered_count:list.length,member_count:list.length};};
+ s.patchGroups=function(){var g=store.FriendGroupStore;if(!g||(s.groupStore&&s.groupStore.store===g))return;
+  var map=g.m_mapGameGroups,d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(g),'games_with_friends_playing');
+  if(!map||typeof map.get!=='function'||typeof g.GetGameGroup!=='function'||!d||!d.get)return;
+  g.GetGameGroup=function(e){var by=s.moved(),base=map.get(e),extra=by[String(e)];
+   if(Number(e)===480&&base){var all=[];Object.keys(by).forEach(function(k){all=all.concat(by[k]);});
+    if(!all.length)return base;var left=base.member_list.filter(function(f){return all.indexOf(f)<0;});return left.length?s.group(left):undefined;}
+   return extra?s.group((base?base.member_list:[]).concat(extra)):base;};
+  g.GetCountFriendsInGame=function(e){var r=g.GetGameGroup(e);return r?r.unfiltered_count||0:0;};
+  Object.defineProperty(g,'games_with_friends_playing',{configurable:true,get:function(){
+   var keys=d.get.call(this).filter(function(k){return Number(k)!==480||!!g.GetGameGroup(480);});
+   Object.keys(s.moved()).forEach(function(k){if(keys.indexOf(Number(k))<0)keys.push(Number(k));});return keys;}});
+  s.groupStore={store:g,map:map};};
+ // Components already rendered observe map keys, not our patch: touch the affected keys.
+ s.nudge=function(){var w=s.groupStore;if(!w)return;var by=s.moved(),sig=JSON.stringify(Object.keys(by).map(function(k){return k+':'+by[k].length;}));
+  if(sig===s.sig)return;var keys=[480].concat(Object.keys(by).map(Number),s.sigKeys||[]);s.sig=sig;s.sigKeys=Object.keys(by).map(Number);
+  var any=w.map.get(480)||Array.from(w.map.values())[0];
+  keys.forEach(function(k){if(w.map.has(k)){var x=w.map.get(k);w.map.delete(k);w.map.set(k,x);}else if(any){w.map.set(k,any);w.map.delete(k);}});};
  s.spacewarIcon=function(){var apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore,current=window.g_FriendsUIApp&&g_FriendsUIApp.FriendStore;
   if(!apps||!current)return null;
   var games=new Set(),unknown=false;
@@ -179,11 +205,11 @@ if(!s){
   if(p.m_strGameExtraInfo===v.name)p.m_strGameExtraInfo=v.beforeName;
   if(p.m_gameid===v.app)p.m_gameid=v.beforeGame;
   s.written.delete(p);};
- s.one=function(p,id){var l=s.labels[String(id)];
+ s.one=function(p,id,f){var l=s.labels[String(id)];
   if(p.m_unGamePlayedAppID!==480||!l){s.clear(p);return;}
   var v=s.written.get(p);
   if(!v||p.m_strGameExtraInfo!==v.name||p.m_gameid!==v.app){v={beforeName:p.m_strGameExtraInfo,beforeGame:p.m_gameid};s.written.set(p,v);}
-  v.name=l.name;v.app=l.app;p.m_strGameExtraInfo=l.name;p.m_gameid=l.app;};
+  v.name=l.name;v.app=l.app;v.friend=f;p.m_strGameExtraInfo=l.name;p.m_gameid=l.app;};
  s.icon=function(p){var v=s.written.get(p),apps=window.g_FriendsUIApp&&g_FriendsUIApp.AppInfoStore;
   if(!v||p.m_gameid!==v.app||!apps)return null;
   var info=apps.GetAppInfo(Number(v.app));return info&&info.icon_url?info.icon_url:null;};
@@ -202,9 +228,9 @@ if(!s){
     s.patch(proto,'UpdateFromMessage',function(o){return function(){s.clear(this);var r=o.apply(this,arguments);s.apply();return r;};});
     s.patch(proto,'GetCurrentGameIconURL',function(o){return function(){return s.icon(this)||o.apply(this,arguments);};});
    }
-   s.one(p,f.accountid);
+   s.one(p,f.accountid,f);
   });
-  s.patchSpacewar();
+  s.patchSpacewar();s.patchGroups();s.nudge();
  };
  s.timer=setInterval(s.apply,5000);
 }

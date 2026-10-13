@@ -90,13 +90,27 @@ const v1=function(){};global.__cabinetLabels={labels:{},written:new Map([[q,{}]]
 Persona.prototype.UpdateFromMessage=v1;let cleared=0;global.clearInterval=()=>{cleared++;};
 ";
             string upgradeCheck = @"
-assert.equal(__cabinetLabels.version,4);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
+assert.equal(__cabinetLabels.version,5);assert.equal(cleared,1);assert.notEqual(Persona.prototype.UpdateFromMessage,v1);assert.equal(q.m_gameid,'2868840');
 assert.notEqual(g_FriendsUIApp.AppInfoStore.m_mapAppInfo.get(480),spacewarOriginal);assert.equal(spacewarOriginal.icon_url,'icon-app-480');
 console.log('PASS older injected script replaced; Spacewar entry swapped, original untouched');
+class Groups{constructor(){this.m_mapGameGroups=new Map();} get games_with_friends_playing(){return Array.from(this.m_mapGameGroups.keys());} GetGameGroup(e){return this.m_mapGameGroups.get(e);} GetCountFriendsInGame(e){var x=this.m_mapGameGroups.get(e);return x?x.unfiltered_count:0;}}
+const fq=Array.from(g_FriendsUIApp.FriendStore.all_friends)[0],gs=new Groups();gs.m_mapGameGroups.set(480,{member_list:[fq],unfiltered_count:1});gs.m_mapGameGroups.set(100,{member_list:[{}],unfiltered_count:1});
+g_FriendsUIApp.FriendStore.FriendGroupStore=gs;let owned=true;global.appStore={GetAppOverviewByAppID:(id)=>owned&&id===2868840?{}:null};
+__cabinetLabels.apply();
+assert.equal(gs.GetCountFriendsInGame(2868840),1);assert.equal(gs.GetGameGroup(2868840).member_list[0],fq);assert.equal(gs.GetGameGroup(480),undefined);assert.equal(gs.GetCountFriendsInGame(480),0);
+assert.deepEqual(gs.games_with_friends_playing.sort(),[100,2868840]);assert.equal(gs.GetCountFriendsInGame(100),1);
+owned=false;__cabinetLabels.apply();
+assert.equal(gs.GetGameGroup(2868840),undefined);assert.equal(gs.GetCountFriendsInGame(480),1);assert.deepEqual(gs.games_with_friends_playing.sort(),[100,480]);
+console.log('PASS friends counted under the real game only when it is in the library');
 ";
             File.WriteAllText(path, mock + script + ";\n" + behavior + script + ";\n" + tail + upgrade + script + ";\n" + upgradeCheck);
-            using (var process = Process.Start(new ProcessStartInfo("bun", "\"" + path + "\"") { UseShellExecute = false, CreateNoWindow = true }))
-            { if (!process.WaitForExit(15000)) { process.Kill(); throw new Exception("Script checks timed out"); } Check(process.ExitCode == 0, "script behavior"); }
+            using (var process = Process.Start(new ProcessStartInfo("bun", "\"" + path + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true }))
+            {
+                var stderr = process.StandardError.ReadToEndAsync(); Console.Write(process.StandardOutput.ReadToEnd());
+                if (!process.WaitForExit(15000)) { process.Kill(); throw new Exception("Script checks timed out"); }
+                if (process.ExitCode != 0) Console.WriteLine(stderr.Result);
+                Check(process.ExitCode == 0, "script behavior");
+            }
         }
         finally { File.Delete(path); }
         var players = new Dictionary<string, object> { { "players", new object[] {
