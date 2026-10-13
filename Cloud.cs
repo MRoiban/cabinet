@@ -98,7 +98,7 @@ namespace Cabinet
         {
             lock (Gate) running = new HashSet<string>(runningAppIds ?? new string[0]);
             if (wasPlaying && !anyGameRunning) requested = true; wasPlaying = anyGameRunning;
-            string result = message; message = null; if (busy) return result;
+            string result = message; message = null; FriendLabels.Tick(Client, runningAppIds, Log); if (busy) return result;
             try
             {
                 Directory.CreateDirectory(App.DataDir);
@@ -147,10 +147,12 @@ namespace Cabinet
             var connect = new ToolStripMenuItem(L.T("Connect…", "Se connecter…"));
             var sync = new ToolStripMenuItem(L.T("Sync now", "Synchroniser"));
             var disconnect = new ToolStripMenuItem(L.T("Disconnect", "Se déconnecter"));
-            root.DropDownItems.AddRange(new ToolStripItem[] { status, connect, sync, disconnect });
+            var labels = FriendLabels.MenuItem();
+            root.DropDownItems.AddRange(new ToolStripItem[] { status, connect, sync, disconnect, labels });
             root.DropDownOpening += delegate
             {
                 status.Text = Client.Connected ? L.T("Connected as ", "Connecté en tant que ") + Client.UserName.Replace("&", "&&") : L.T("Not connected", "Non connecté");
+                labels.Visible = Client.Connected && !FriendLabels.DebugEnabled();
                 connect.Enabled = !busy; sync.Enabled = Client.Connected; disconnect.Enabled = Client.Connected && !busy;
             };
             connect.Click += delegate { ShowConnect(); }; sync.Click += delegate { requested = true; };
@@ -409,14 +411,27 @@ namespace Cabinet
         internal static string Hash(byte[] bytes) { using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant(); }
         internal object RequestJson(string method, string path, object body)
         { return Json.DeserializeObject(Encoding.UTF8.GetString(Request(method, path, body == null ? null : Encoding.UTF8.GetBytes(Json.Serialize(body)), "application/json", false))); }
+        internal string PresenceKey { get { return settings.server + ":" + settings.userId + ":" + settings.token; } }
+        internal Func<string, string, object, object> PresenceRequest()
+        {
+            string server = settings.server, token = settings.token;
+            return delegate(string method, string path, object body)
+            {
+                var json = new JavaScriptSerializer();
+                byte[] bytes = RequestTo(server, token, method, path, body == null ? null : Encoding.UTF8.GetBytes(json.Serialize(body)), "application/json", false, 5000);
+                return json.DeserializeObject(Encoding.UTF8.GetString(bytes));
+            };
+        }
         byte[] Request(string method, string path, byte[] body, string type, bool acceptConflict)
+        { return RequestTo(settings.server, settings.token, method, path, body, type, acceptConflict, 30000); }
+        static byte[] RequestTo(string server, string token, string method, string path, byte[] body, string type, bool acceptConflict, int timeout)
         {
             ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
-            var req = (HttpWebRequest)WebRequest.Create(settings.server + path);
-            req.Method = method; req.Timeout = 30000; req.ReadWriteTimeout = 30000; req.AllowAutoRedirect = false;
-            req.UserAgent = "Cabinet/" + BuildInfo.Version; req.Headers[HttpRequestHeader.Authorization] = "Bearer " + settings.token;
+            var req = (HttpWebRequest)WebRequest.Create(server + path);
+            req.Method = method; req.Timeout = timeout; req.ReadWriteTimeout = timeout; req.AllowAutoRedirect = false;
+            req.UserAgent = "Cabinet/" + BuildInfo.Version; req.Headers[HttpRequestHeader.Authorization] = "Bearer " + token;
             // Bedrock rejects writes whose Origin isn't the pebble's own.
-            req.Headers["Origin"] = new Uri(settings.server).GetLeftPart(UriPartial.Authority);
+            req.Headers["Origin"] = new Uri(server).GetLeftPart(UriPartial.Authority);
             if (body != null) { req.ContentType = type; req.ContentLength = body.Length; using (var s = req.GetRequestStream()) s.Write(body, 0, body.Length); }
             HttpWebResponse response;
             try { response = (HttpWebResponse)req.GetResponse(); }

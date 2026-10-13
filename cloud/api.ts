@@ -1,8 +1,8 @@
-import { and, eq, BedrockError, type FunctionContext, type RouteHandler } from "bedrock";
+import { and, eq, lt, gte, BedrockError, type FunctionContext, type RouteHandler } from "bedrock";
 import { authenticate } from "./auth";
-import { apps, devices, saves, users } from "./schema";
+import { apps, devices, saves, users, presence } from "./schema";
 import { emptyState, merge, progress, type AppState, type SaveMeta } from "./merge";
-import { appId, invalid, jsonBody, label, timestamp } from "./validation";
+import { accountId, presenceBody, appId, invalid, jsonBody, label, timestamp } from "./validation";
 import { MAX_SAVE, saveZips, withSaveStorage } from "./storage";
 
 const appKey = (userId: string, appid: string) => and(eq(apps.userId, userId), eq(apps.appid, appid));
@@ -41,6 +41,29 @@ export function api(handler: (request: Request, ctx: FunctionContext, userId: st
   };
 }
 export const apiRoutes: Record<string, RouteHandler> = {
+  "PUT /api/presence": api(async (request, ctx, id) => {
+    const values = { ...presenceBody(await jsonBody(request)), userId: id, updatedAt: Date.now() };
+    ctx.db.insert(presence).values(values).onConflictDoUpdate({ target: [presence.userId, presence.accountId], set: values }).run();
+    return Response.json({ accountId: values.accountId, appId: values.appId, name: values.name, updatedAt: values.updatedAt });
+  }),
+  "DELETE /api/presence": api((request, ctx, id) => {
+    const raw = new URL(request.url).searchParams.get("accountId") ?? "";
+    if ((!/^\d{1,10}$/.test(raw) || raw.trim() !== raw)) invalid("Invalid Steam accountId.");
+    ctx.db.delete(presence).where(and(eq(presence.userId, id), eq(presence.accountId, accountId(Number(raw))))).run();
+    return Response.json({ ok: true });
+  }),
+  "GET /api/presence": api((_request, ctx) => {
+    const cutoff = Date.now() - 3 * 60 * 1000;
+    ctx.db.delete(presence).where(lt(presence.updatedAt, cutoff)).run();
+    const rows = ctx.db.select().from(presence).where(gte(presence.updatedAt, cutoff)).all();
+    // Multiple token-users may share a Steam account; its freshest report wins.
+    const players = new Map<number, { accountId: number; appId: string; name: string; updatedAt: number }>();
+    for (const row of rows) {
+      const { accountId, appId, name, updatedAt } = row;
+      if (!players.has(accountId) || players.get(accountId)!.updatedAt < updatedAt) players.set(accountId, { accountId, appId, name, updatedAt });
+    }
+    return Response.json({ players: [...players.values()] });
+  }),
   "GET /api/me": api((_request, ctx, id) => {
     const user = ctx.db.select().from(users).where(eq(users.id, id)).get()!;
     return Response.json({ user: { id, name: user.name } });

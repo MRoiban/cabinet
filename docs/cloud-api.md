@@ -1,7 +1,7 @@
 # Cabinet Cloud API (contract between `cloud/` pebble and `Cloud.cs` client)
 
 Cabinet Cloud is a Bedrock pebble (`cloud/`, name `cabinet`) served at `https://cabinet.<domain>`.
-It carries saves, achievements, stats and playtime for OnlineFix games across a user's PCs.
+It carries saves, achievements, stats, playtime and real-game presence for OnlineFix games across a user's PCs.
 
 ## Accounts and tokens
 
@@ -30,6 +30,9 @@ It carries saves, achievements, stats and playtime for OnlineFix games across a 
 
 | Method | Path | Body | Response |
 |---|---|---|---|
+| PUT | `/api/presence` | `{ accountId, appId, name }` | `{ accountId, appId, name, updatedAt }` |
+| DELETE | `/api/presence?accountId=` | | `{ "ok": true }` |
+| GET | `/api/presence` | | `{ "players": [{ accountId, appId, name, updatedAt }] }` |
 | GET | `/api/me` | | `{ "user": { "id", "name" } }` |
 | GET | `/api/state` | | `{ "apps": { "<appid>": AppState } }` |
 | POST | `/api/apps/<appid>/progress` | `{ deviceId, deviceName, achievements, stats?, statsUpdatedAt?, playtimeMinutes }` | merged `AppState` |
@@ -59,4 +62,44 @@ SaveMeta = { sha256, size, updatedAt: unixMs, deviceId, deviceName }
     remember per remote device how many minutes were already applied);
   - newer save from another device → only when that game is not running; zip the current local saves to
     `%LOCALAPPDATA%\Cabinet\backup\saves\<appid>\<timestamp>.zip` first, then replace.
-- Never runs while a game is running for that app. Network failures are silent (log only), retried next round.
+- Save/progress synchronization never runs while a game is running for that app. Network failures are silent (log only), retried next round.
+
+## Real-game presence
+
+`accountId` is a numeric positive Steam **32-bit account ID** (1 through
+4294967295), not a SteamID64. `appId` is a string of 1?10 ASCII digits; `name` is
+1?100 characters, nonblank, with no control characters (U+0000?001F or
+U+007F?009F). Invalid bodies or delete account IDs return 400.
+
+PUT upserts the bearer-token user's row for that account ID and sets `updatedAt`
+to server Unix milliseconds. DELETE removes only that user's row and succeeds
+when absent. GET shares fresh presence across **all token-users on this server**,
+without exposing their cloud user IDs. Rows older than three minutes are ignored
+and pruned on GET. If multiple users report one Steam account, GET returns its
+freshest report. All calls require bearer authentication; writes follow the same
+Bedrock Origin policy as existing API writes. Cabinet sends its configured server
+origin on every request, including DELETE.
+
+The client publishes immediately when its detected running game/account changes,
+then about every 60 seconds, and deletes on stop/disconnect/account changes as a
+best effort. Its name resolver is shared with the Games menu (cached schema,
+then Steam manifest, then app ID); controls are removed and names truncated to
+100 characters before sharing. Several concurrent games resolve to the first
+app ID in ordinal order. Crashes are covered by server TTL.
+
+On a background worker, Cabinet fetches presence about every 60 seconds while
+Steam is running and cloud is connected, excludes its own account and stale
+reports, and sends serialized JSON to Steam's `SharedJSContext` through CDP.
+The idempotent script changes only friends' `m_strGameExtraInfo` when their
+`m_unGamePlayedAppID` is 480. A single prototype wrapper reapplies names after
+`UpdateFromMessage`; a five-second local timer covers other local changes.
+Previously written names are restored only if the current value still equals
+Cabinet's value. Missing labels, leaving 480, disconnect, and expiration clear
+Cabinet's changes. App IDs, game IDs, and join metadata are untouched. The icon
+remains Spacewar's; no fragile icon lookup is installed.
+
+The tray's opt-in creates `.cef-enable-remote-debugging` in Steam's folder; Steam
+must be restarted by the user. This opens a localhost-only UI debugging port
+(8080). HTTP discovery, websocket connection and receive operations have bounded
+timeouts, and every round rediscovers the target so Steam restarts need no manual
+reconnection. No extra resident process is started.

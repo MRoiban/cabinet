@@ -24,3 +24,9 @@ export const saves = sqliteTable("saves", {
   fileId: text("file_id").notNull(), sha256: text("sha256").notNull(), size: integer("size").notNull(),
   updatedAt: integer("updated_at").notNull(), deviceId: text("device_id").notNull(), deviceName: text("device_name").notNull(),
 }, t => [primaryKey({ columns: [t.userId, t.appid] })]);
+
+export const presence = sqliteTable("presence", {
+  userId: text("user_id").notNull().references(() => users.id),
+  accountId: integer("account_id").notNull(), appId: text("app_id").notNull(),
+  name: text("name").notNull(), updatedAt: integer("updated_at").notNull(),
+}, t => [primaryKey({ columns: [t.userId, t.accountId] })]);

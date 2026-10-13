@@ -113,3 +113,13 @@ regeneration, user isolation, saves, and blocked generic bucket endpoints.
   extracted or interpreted by the server.
 
 ETag is the bare SHA-256 string exactly as specified by the Cabinet contract.
+
+## Presence
+
+Authenticated PUT/DELETE `/api/presence` update only the token-user's account rows.
+GET shares real-game names and Steam account IDs across the server's users;
+reports expire after three minutes and stale rows are pruned. The `presence`
+table and migration `0001_melodic_network` are included. See the client contract
+for validation, privacy scope, Origin headers, and Steam's optional localhost
+UI debugging port. Tests cover heartbeat upserts, cross-user reads, isolated
+deletion, TTL pruning, authentication and malformed reports.

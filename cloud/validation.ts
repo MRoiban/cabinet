@@ -52,3 +52,15 @@ export async function jsonBody(request: Request): Promise<Record<string, unknown
   try { value = JSON.parse(body); } catch { invalid("Malformed JSON."); }
   return record(value);
 }
+
+export function accountId(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > 0xffffffff) invalid("Invalid Steam accountId.");
+  return value;
+}
+export function presenceBody(body: Record<string, unknown>) {
+  const id = accountId(body.accountId);
+  if (typeof body.appId !== "string" || (!/^\d{1,10}$/.test(body.appId) || body.appId.trim() !== body.appId)) invalid("Invalid appId.");
+  const name = label(body.name, 100);
+  if (/[\u007f-\u009f]/.test(name)) invalid("Invalid game name.");
+  return { accountId: id, appId: body.appId, name };
+}

@@ -1991,24 +1991,43 @@ namespace Cabinet
             public long Recent;
         }
 
+        internal static string GameName(string id)
+        {
+            try
+            {
+                if (File.Exists(SchemaFill.SchemaPath(id)))
+                {
+                    var game = KV.Read(File.ReadAllBytes(SchemaFill.SchemaPath(id))).Children.FirstOrDefault();
+                    var gn = game == null ? null : game.Get("gamename");
+                    if (gn != null && !string.IsNullOrEmpty(gn.Str())) return gn.Str();
+                }
+                foreach (var lib in Playtime.Libraries())
+                {
+                    var manifest = Path.Combine(lib, "steamapps", "appmanifest_" + id + ".acf");
+                    if (!File.Exists(manifest)) continue;
+                    var m = System.Text.RegularExpressions.Regex.Match(File.ReadAllText(manifest), "\"name\"\\s+\"([^\"]+)\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (m.Success) return m.Groups[1].Value;
+                }
+            }
+            catch (Exception ex) { Log("game name " + id + ": " + ex.Message); }
+            return id;
+        }
+
         static List<GameOverview> Games(Dictionary<string, string> times)
         {
             var result = new List<GameOverview>();
             string account = Syncer.AccountId();
             var cfg = account == null ? null : Path.Combine(Syncer.SteamPath(), "userdata", account, "config", "localconfig.vdf");
             var vdf = cfg != null && File.Exists(cfg) ? new VdfText(File.ReadAllText(cfg)) : null;
-            var libraries = Playtime.Libraries().ToArray();
             foreach (var id in Syncer.OnlineFixAppIds())
             {
-                string name = id;
+                string name = GameName(id);
                 int total = 0, unlocked = 0;
                 try
                 {
                     if (File.Exists(SchemaFill.SchemaPath(id)))
                     {
                         var game = KV.Read(File.ReadAllBytes(SchemaFill.SchemaPath(id))).Children.FirstOrDefault();
-                        var gn = game == null ? null : game.Get("gamename");
-                        if (gn != null && !string.IsNullOrEmpty(gn.Str())) name = gn.Str();
                         var stats = game == null ? null : game.Get("stats");
                         var userPath = Path.Combine(Syncer.StatsDir(), "UserGameStats_" + account + "_" + id + ".bin");
                         var cache = File.Exists(userPath) ? KV.Read(File.ReadAllBytes(userPath)).Children.FirstOrDefault() : null;
@@ -2026,13 +2045,6 @@ namespace Cabinet
                                 total++; if ((mask & (1 << n)) != 0) unlocked++;
                             }
                         }
-                    }
-                    if (name == id) foreach (var lib in libraries)
-                    {
-                        var manifest = Path.Combine(lib, "steamapps", "appmanifest_" + id + ".acf");
-                        if (!File.Exists(manifest)) continue;
-                        var m = System.Text.RegularExpressions.Regex.Match(File.ReadAllText(manifest), "\"name\"\\s+\"([^\"]+)\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                        if (m.Success) { name = m.Groups[1].Value; break; }
                     }
                 }
                 catch (Exception ex) { Log("overview " + id + ": " + ex.Message); }

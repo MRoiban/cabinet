@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startPebble } from "bedrock/server";
 import { eq } from "bedrock";
-import { saves, tokens } from "./schema";
+import { saves, tokens, presence } from "./schema";
 import { hashToken } from "./auth";
 
 let running: Awaited<ReturnType<typeof startPebble>>, temp: string, base: string;
@@ -123,4 +123,39 @@ test("regeneration invalidates old token and keeps user state", async () => {
   expect((await call("/api/me")).status).toBe(200);
   const state = await (await call("/api/state")).json() as { apps: Record<string, unknown> };
   expect(Object.keys(state.apps)).toEqual(["123"]);
+});
+
+test("presence shares fresh reports, upserts and isolates deletion", async () => {
+  const other = await create("Presence friend");
+  const put = (bearer: string, accountId: number, name: string) => call("/api/presence", {
+    method: "PUT", headers: { origin: base, "content-type": "application/json" },
+    body: JSON.stringify({ accountId, appId: "123", name }),
+  }, bearer);
+  expect((await put(token, 1234, "First game")).status).toBe(200);
+  expect((await put(token, 1234, "Second game")).status).toBe(200);
+  expect((await put(other, 4294967295, "Friend game")).status).toBe(200);
+  const read = async () => (await (await call("/api/presence")).json() as { players: { accountId: number; name: string; updatedAt: number }[] }).players;
+  const players = await read();
+  expect(players.length).toBe(2);
+  expect(players.find(p => p.accountId === 1234)?.name).toBe("Second game");
+  expect(players.every(p => p.updatedAt >= Date.now() - 10000 && !("userId" in p))).toBe(true);
+  expect((await call("/api/presence?accountId=1234", { method: "DELETE", headers: { origin: base } }, other)).status).toBe(200);
+  expect((await read()).length).toBe(2);
+  await call("/api/presence?accountId=1234", { method: "DELETE", headers: { origin: base } });
+  expect((await read()).length).toBe(1);
+  running.db.update(presence).set({ updatedAt: Date.now() - 180001 }).run();
+  expect(await read()).toEqual([]);
+  expect(running.db.select().from(presence).all()).toEqual([]);
+});
+test("presence validates identifiers, names, authentication and deletion", async () => {
+  for (const change of [
+    { accountId: 0 }, { accountId: -1 }, { accountId: 4294967296 }, { accountId: 1.5 }, { accountId: "1" },
+    { appId: "" }, { appId: "abc" }, { appId: "123\n" }, { appId: "12345678901" }, { appId: 123 },
+    { name: "" }, { name: " " }, { name: "x".repeat(101) }, { name: "a\n" }, { name: "a\u007f" }, { name: "a\u0085" },
+  ]) expect((await call("/api/presence", { method: "PUT", headers: { origin: base },
+    body: JSON.stringify({ accountId: 1, appId: "123", name: "Game", ...change }) })).status).toBe(400);
+  for (const account of ["", "0", "-1", "1.5", "4294967296", "abc"])
+    expect((await call(`/api/presence?accountId=${account}`, { method: "DELETE", headers: { origin: base } })).status).toBe(400);
+  for (const method of ["GET", "PUT", "DELETE"])
+    expect((await call("/api/presence", { method, headers: { origin: base } }, "invalid")).status).toBe(401);
 });
