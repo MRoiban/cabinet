@@ -1,4 +1,4 @@
-// Cabinet - copies OnlineFix achievements/stats into Steam's local stats cache
+﻿// Cabinet - copies OnlineFix achievements/stats into Steam's local stats cache
 // so OnlineFix (Spacewar) games show progress under their real app in the Steam client.
 // Build: build.cmd   Run once: it installs itself to startup and lives in the tray.
 
@@ -19,6 +19,25 @@ using Microsoft.Win32;
 
 namespace Cabinet
 {
+    // ---------- Localisation ----------
+    // French when the Windows display language is French (override with CABINET_LANG=fr|en), English otherwise.
+    static class L
+    {
+        public static readonly bool Fr = IsFrench();
+
+        static bool IsFrench()
+        {
+            var forced = Environment.GetEnvironmentVariable("CABINET_LANG");
+            if (!string.IsNullOrEmpty(forced)) return forced.StartsWith("fr", StringComparison.OrdinalIgnoreCase);
+            return CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "fr";
+        }
+
+        public static string T(string en, string fr) { return Fr ? fr : en; }
+
+        // Hours with one decimal, using the local decimal separator in French ("74,5 h").
+        public static string Hours(double h) { return h.ToString("0.#", Fr ? CultureInfo.GetCultureInfo("fr-FR") : CultureInfo.InvariantCulture) + " h"; }
+    }
+
     // ---------- Binary KeyValues (Valve) ----------
     class KV
     {
@@ -931,7 +950,7 @@ namespace Cabinet
             var tmp = cfg + ".tmp";
             File.WriteAllText(tmp, vdf.Text, new UTF8Encoding(false));
             File.Replace(tmp, cfg, null);
-            return "Playtime added (shows when Steam starts):\n" + string.Join("\n", added);
+            return L.T("Playtime added (shows when Steam starts):\n", "Temps de jeu ajouté (visible au démarrage de Steam) :\n") + string.Join("\n", added);
         }
 
         // After Steam has restarted and saved its config, make sure our minutes survived; re-queue if not.
@@ -1026,7 +1045,7 @@ namespace Cabinet
             {
                 if (!batch) return null;
                 batch = false; int count = found; found = 0;
-                return count > 0 ? "Found achievement lists for " + count + " games." : null;
+                return count > 0 ? L.T("Found achievement lists for " + count + " games.", "Listes de succès trouvées pour " + count + " jeux.") : null;
             }
             batch = true; appId = id;
             var name = "Local\\Cabinet-schema-" + Guid.NewGuid().ToString("N");
@@ -1121,15 +1140,15 @@ namespace Cabinet
                 trayIcon = new Icon(stream, SystemInformation.SmallIconSize);
             tray = new NotifyIcon { Icon = trayIcon, Text = "Cabinet", Visible = true };
             var menu = new ContextMenuStrip();
-            var games = new ToolStripMenuItem("Games");
+            var games = new ToolStripMenuItem(L.T("Games", "Jeux"));
             menu.Items.Add(games);
             menu.Opening += delegate { PopulateGames(games); };
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Sync now", null, delegate { Tick(true); });
-            menu.Items.Add("Open log", null, delegate { if (File.Exists(LogPath)) Process.Start("notepad.exe", LogPath); });
-            menu.Items.Add("Check for updates", null, delegate { CheckUpdates(true); });
-            menu.Items.Add("Uninstall", null, delegate { Uninstall(); });
-            menu.Items.Add("Exit", null, delegate { tray.Visible = false; Application.Exit(); });
+            menu.Items.Add(L.T("Sync now", "Synchroniser"), null, delegate { Tick(true); });
+            menu.Items.Add(L.T("Open log", "Ouvrir le journal"), null, delegate { if (File.Exists(LogPath)) Process.Start("notepad.exe", LogPath); });
+            menu.Items.Add(L.T("Check for updates", "Rechercher des mises à jour"), null, delegate { CheckUpdates(true); });
+            menu.Items.Add(L.T("Uninstall", "Désinstaller"), null, delegate { Uninstall(); });
+            menu.Items.Add(L.T("Exit", "Quitter"), null, delegate { tray.Visible = false; Application.Exit(); });
             menu.Items.Add(new ToolStripMenuItem("Cabinet " + BuildInfo.Version) { Enabled = false });
             tray.ContextMenuStrip = menu;
             timer = new System.Windows.Forms.Timer { Interval = 5000 };
@@ -1152,7 +1171,7 @@ namespace Cabinet
                 if (schemaMsg != null) tray.ShowBalloonTip(5000, "Cabinet", schemaMsg, ToolTipIcon.Info);
                 if (msg != null) tray.ShowBalloonTip(5000, "Cabinet", msg, ToolTipIcon.Info);
                 int pend = playtime.PendingMinutes();
-                tray.Text = pend > 0 ? "Cabinet - " + Playtime.FormatMin(pend) + " pending" : "Cabinet";
+                tray.Text = pend > 0 ? "Cabinet - " + Playtime.FormatMin(pend) + L.T(" pending", " en attente") : "Cabinet";
             }
             catch (Exception ex) { Log("playtime/shadow error: " + ex.Message); }
             try
@@ -1178,15 +1197,15 @@ namespace Cabinet
                     if (r.NewAchievements > 0 || r.StatsChanged > 0)
                     {
                         Log(r.GameName + " (" + appId + "): +" + r.NewAchievements + " achievements, " + r.StatsChanged + " stats");
-                        if (r.NewAchievements > 0) synced.Add(r.GameName + ": +" + r.NewAchievements + " achievement" + (r.NewAchievements == 1 ? "" : "s"));
+                        if (r.NewAchievements > 0) synced.Add(r.GameName + " : +" + r.NewAchievements + L.T(" achievement", " succès") + (r.NewAchievements == 1 || L.Fr ? "" : "s"));
                     }
                 }
                 SaveState();
                 File.WriteAllLines(SyncTimesPath, syncTimes.Select(kv => kv.Key + "|" + kv.Value).ToArray());
                 if (synced.Count > 0)
-                    tray.ShowBalloonTip(5000, "Achievements synced to Steam", string.Join("\n", synced), ToolTipIcon.Info);
+                    tray.ShowBalloonTip(5000, L.T("Achievements synced to Steam", "Succès synchronisés avec Steam"), string.Join("\n", synced), ToolTipIcon.Info);
                 else if (force)
-                    tray.ShowBalloonTip(3000, "Cabinet", "Everything is already in sync.", ToolTipIcon.Info);
+                    tray.ShowBalloonTip(3000, "Cabinet", L.T("Everything is already in sync.", "Tout est déjà synchronisé."), ToolTipIcon.Info);
             }
             catch (Exception ex) { Log("error: " + ex.Message); }
 
@@ -1268,13 +1287,13 @@ namespace Cabinet
                 // Skip games with nothing to show, and unnamed ones (uninstalled, no achievement list).
                 if ((total == 0 && minutes == 0) || name == id) continue;
                 var parts = new List<string>();
-                string playedText = minutes == 0 ? "" : minutes < 60 ? minutes + " min" : (minutes / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + " h";
+                string playedText = minutes == 0 ? "" : minutes < 60 ? minutes + " min" : L.Hours(minutes / 60.0);
                 if (total > 0) parts.Add(unlocked + " / " + total + " achievements");
                 if (minutes > 0) parts.Add(playedText);
                 result.Add(new GameOverview { Id = id, Name = name, Detail = string.Join("   ·   ", parts.ToArray()),
                     Unlocked = unlocked, Total = total, Played = playedText,
                     Recent = Math.Max(played, date == DateTime.MinValue ? 0 : Playtime.Unix(date)),
-                    Tip = "Last synced " + (date == DateTime.MinValue ? "never" : date.ToLocalTime().ToString("g")) + "\nClick to open in Steam" });
+                    Tip = L.T("Last synced ", "Dernière synchro : ") + (date == DateTime.MinValue ? L.T("never", "jamais") : date.ToLocalTime().ToString("g")) + L.T("\nClick to open in Steam", "\nCliquer pour ouvrir dans Steam") });
             }
             return result.OrderByDescending(g => g.Recent).ThenBy(g => g.Text, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
@@ -1296,7 +1315,7 @@ namespace Cabinet
                     menu.DropDownItems.Add(item);
                 }
                 GameMenuItem.Measure(menu.DropDownItems.OfType<GameMenuItem>().ToList());
-                if (menu.DropDownItems.Count == 0) menu.DropDownItems.Add(new ToolStripMenuItem("No tracked games yet") { Enabled = false });
+                if (menu.DropDownItems.Count == 0) menu.DropDownItems.Add(new ToolStripMenuItem(L.T("No tracked games yet", "Aucun jeu suivi pour l'instant")) { Enabled = false });
             }
             catch (Exception ex) { Log("overview failed: " + ex.Message); }
         }
@@ -1312,7 +1331,7 @@ namespace Cabinet
             public GameMenuItem(GameOverview g)
             {
                 header = g == null;
-                if (header) { Text = "Game"; unlocked = ""; total = "Achievements"; played = "Played"; Enabled = false; return; }
+                if (header) { Text = L.T("Game", "Jeu"); unlocked = ""; total = L.T("Achievements", "Succès"); played = L.T("Played", "Temps de jeu"); Enabled = false; return; }
                 Text = g.Name.Replace("&", "&&");
                 unlocked = g.Total > 0 ? g.Unlocked.ToString() : "";
                 total = g.Total > 0 ? "/ " + g.Total : "";
@@ -1391,7 +1410,7 @@ namespace Cabinet
                 var latest = NumericVersion(Convert.ToString(release["tag_name"]));
                 var current = NumericVersion(BuildInfo.Version);
                 if (latest == null || current == null) throw new InvalidDataException("Invalid release version");
-                if (latest <= current) return "Cabinet is up to date (" + BuildInfo.Version + ").";
+                if (latest <= current) return L.T("Cabinet is up to date (", "Cabinet est à jour (") + BuildInfo.Version + ").";
                 var assets = release["assets"] as System.Collections.IEnumerable;
                 if (assets != null) foreach (Dictionary<string, object> asset in assets)
                 {
@@ -1408,20 +1427,20 @@ namespace Cabinet
                         File.Move(tmp, path); download = path;
                     }
                     finally { if (File.Exists(tmp)) File.Delete(tmp); }
-                    return "Downloaded Cabinet " + release["tag_name"] + ". Installation waits until games finish.";
+                    return L.T("Downloaded Cabinet ", "Cabinet ") + release["tag_name"] + L.T(". Installation waits until games finish.", " téléchargé. Installation après la fin des parties.");
                 }
-                return "A newer release has no Cabinet.exe asset yet.";
+                return L.T("A newer release has no Cabinet.exe asset yet.", "La nouvelle version n'a pas encore de Cabinet.exe.");
             }
         }
 
         void CheckUpdates(bool manual)
         {
             if (checkingUpdate) { if (manual) manualUpdate = true; return; }
-            if (updateDownload != null) { if (manual) tray.ShowBalloonTip(3000, "Cabinet", "Update ready; waiting until games finish.", ToolTipIcon.Info); return; }
+            if (updateDownload != null) { if (manual) tray.ShowBalloonTip(3000, "Cabinet", L.T("Update ready; waiting until games finish.", "Mise à jour prête ; installation après la fin des parties."), ToolTipIcon.Info); return; }
             if (shadows.HasChildren || schemas.HasChild || Shadows.AnyHelper() || playtime.RunningApps().Count > 0)
             {
                 manualUpdate |= manual; nextUpdate = DateTime.UtcNow.AddSeconds(30);
-                if (manual) tray.ShowBalloonTip(3000, "Cabinet", "Update check deferred until games finish.", ToolTipIcon.Info);
+                if (manual) tray.ShowBalloonTip(3000, "Cabinet", L.T("Update check deferred until games finish.", "Vérification reportée à la fin des parties."), ToolTipIcon.Info);
                 return;
             }
             manualUpdate |= manual; checkingUpdate = true; nextUpdate = DateTime.UtcNow.AddHours(24);
@@ -1523,7 +1542,7 @@ namespace Cabinet
         {
             using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true)) if (k != null) k.DeleteValue("Cabinet", false);
             tray.Visible = false;
-            MessageBox.Show("Cabinet removed from startup.\nYou can delete " + DataDir + " if you want.", "Cabinet");
+            MessageBox.Show(L.T("Cabinet removed from startup.\nYou can delete ", "Cabinet ne démarre plus avec Windows.\nVous pouvez supprimer ") + DataDir + L.T(" if you want.", " si vous le souhaitez."), "Cabinet");
             Application.Exit();
         }
 
@@ -1690,7 +1709,7 @@ namespace Cabinet
                 foreach (var p in Process.GetProcessesByName("Cabinet"))
                     using (p) if (p.Id != Process.GetCurrentProcess().Id) { try { p.Kill(); p.WaitForExit(5000); } catch { } }
                 Process.Start(Install());
-                if (!args.Contains("--update")) MessageBox.Show("Cabinet is installed and running in the tray.\nIt starts with Windows and syncs OnlineFix achievements and playtime to Steam automatically.", "Cabinet");
+                if (!args.Contains("--update")) MessageBox.Show(L.T("Cabinet is installed and running in the tray.\nIt starts with Windows and syncs OnlineFix achievements and playtime to Steam automatically.", "Cabinet est installé et tourne dans la zone de notification.\nIl démarre avec Windows et synchronise automatiquement les succès et le temps de jeu OnlineFix avec Steam."), "Cabinet");
                 return;
             }
 

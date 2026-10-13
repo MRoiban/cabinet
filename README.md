@@ -24,6 +24,7 @@ Games patched with OnlineFix talk to Steam as AppID 480 (Spacewar), so Steam cre
 - **Achievements and stats**: copied from OnlineFix's local files (`C:\Users\Public\Documents\OnlineFix\<appid>\Stats`) into the real game's entry in the Steam client.
 - **Missing achievement lists**: if Steam has never downloaded a game's achievement list, Cabinet fetches it automatically.
 - **Overview**: right-click the tray icon → *Games* for achievements unlocked, hours played and last sync per game.
+- **English and French**: follows the Windows display language (set `CABINET_LANG=fr` or `en` to override).
 - **Fallback**: if live tracking can't start, playtime is recorded and added to Steam the next time Steam is closed.
 
 Achievements live in your local Steam client. Steam only uploads them to your public profile for games your account owns.
