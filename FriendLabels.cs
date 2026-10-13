@@ -1,6 +1,8 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -33,19 +35,36 @@ namespace Cabinet
             if (clean.Length > 100) clean = clean.Substring(0, char.IsHighSurrogate(clean[99]) ? 99 : 100);
             return clean;
         }
+        static string DebugFlag() { return Path.Combine(Syncer.SteamPath(), ".cef-enable-remote-debugging"); }
+        // Steam only checks that the name exists; other tools create it as a folder or link.
         internal static bool DebugEnabled()
-        { return File.Exists(Path.Combine(Syncer.SteamPath(), ".cef-enable-remote-debugging")); }
+        {
+            try { File.GetAttributes(DebugFlag()); return true; }
+            catch { return false; }
+        }
         internal static ToolStripMenuItem MenuItem()
         {
             var item = new ToolStripMenuItem(L.T("Show friends' real games (applies after Steam restarts)", "Afficher les vrais jeux des amis (après le redémarrage de Steam)"));
             item.Click += delegate
             {
-                try
+                string flag = DebugFlag();
+                try { using (File.Open(flag, FileMode.OpenOrCreate, FileAccess.Write)) { } }
+                catch (UnauthorizedAccessException)
                 {
-                    using (File.Open(Path.Combine(Syncer.SteamPath(), ".cef-enable-remote-debugging"), FileMode.OpenOrCreate, FileAccess.Write)) { }
-                    MessageBox.Show(L.T("Friends' real games will appear after you restart Steam.", "Les vrais jeux des amis apparaîtront après le redémarrage de Steam."), L.T("Cabinet", "Cabinet"));
+                    // Steam under Program Files is often admin-only: ask Windows for elevation once.
+                    try
+                    {
+                        var psi = new ProcessStartInfo("cmd.exe", "/c type nul > \"" + flag + "\"");
+                        psi.Verb = "runas"; psi.UseShellExecute = true; psi.WindowStyle = ProcessWindowStyle.Hidden;
+                        using (var p = Process.Start(psi)) p.WaitForExit(15000);
+                    }
+                    catch (Win32Exception) { } // UAC declined
                 }
-                catch { MessageBox.Show(L.T("Cannot write to the Steam folder. Create .cef-enable-remote-debugging there, then restart Steam.", "Impossible d'écrire dans le dossier Steam. Créez-y .cef-enable-remote-debugging, puis redémarrez Steam."), L.T("Cabinet", "Cabinet")); }
+                catch (IOException) { }
+                if (DebugEnabled())
+                    MessageBox.Show(L.T("Friends' real games will appear after you restart Steam.", "Les vrais jeux des amis apparaîtront après le redémarrage de Steam."), "Cabinet");
+                else
+                    MessageBox.Show(L.T("Cannot write to the Steam folder. Create .cef-enable-remote-debugging there, then restart Steam.", "Impossible d'écrire dans le dossier Steam. Créez-y .cef-enable-remote-debugging, puis redémarrez Steam."), "Cabinet");
             };
             return item;
         }
