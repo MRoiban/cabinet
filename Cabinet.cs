@@ -1210,7 +1210,8 @@ namespace Cabinet
 
         sealed class GameOverview
         {
-            public string Id, Text;
+            public string Id, Name, Detail, Tip;
+            public string Text { get { return Detail.Length == 0 ? Name : Name + " — " + Detail; } }
             public long Recent;
         }
 
@@ -1223,7 +1224,8 @@ namespace Cabinet
             var libraries = Playtime.Libraries().ToArray();
             foreach (var id in Syncer.OnlineFixAppIds())
             {
-                string name = id, achievements = "no list yet";
+                string name = id;
+                int total = 0, unlocked = 0;
                 try
                 {
                     if (File.Exists(SchemaFill.SchemaPath(id)))
@@ -1234,7 +1236,6 @@ namespace Cabinet
                         var stats = game == null ? null : game.Get("stats");
                         var userPath = Path.Combine(Syncer.StatsDir(), "UserGameStats_" + account + "_" + id + ".bin");
                         var cache = File.Exists(userPath) ? KV.Read(File.ReadAllBytes(userPath)).Children.FirstOrDefault() : null;
-                        int total = 0, unlocked = 0;
                         if (stats != null && stats.Children != null) foreach (var stat in stats.Children)
                         {
                             var bits = stat.Get("bits");
@@ -1249,7 +1250,6 @@ namespace Cabinet
                                 total++; if ((mask & (1 << n)) != 0) unlocked++;
                             }
                         }
-                        achievements = unlocked + "/" + total + " achievements";
                     }
                     if (name == id) foreach (var lib in libraries)
                     {
@@ -1264,8 +1264,14 @@ namespace Cabinet
                 if (vdf != null) { long.TryParse(vdf.GetAppValue(id, "Playtime"), out minutes); long.TryParse(vdf.GetAppValue(id, "LastPlayed"), out played); }
                 if (times.TryGetValue(id, out time)) long.TryParse(time, out synced);
                 var date = synced > 0 && synced <= DateTime.MaxValue.Ticks ? new DateTime(synced, DateTimeKind.Utc) : DateTime.MinValue;
-                result.Add(new GameOverview { Id = id, Recent = Math.Max(played, date == DateTime.MinValue ? 0 : Playtime.Unix(date)),
-                    Text = name + " — " + achievements + " — " + (minutes / 60.0).ToString("0.0", CultureInfo.InvariantCulture) + " h — sync " + (date == DateTime.MinValue ? "never" : date.ToLocalTime().ToString("yyyy-MM-dd HH:mm")) });
+                // Skip games with nothing to show, and unnamed ones (uninstalled, no achievement list).
+                if ((total == 0 && minutes == 0) || name == id) continue;
+                var parts = new List<string>();
+                if (total > 0) parts.Add(unlocked + " / " + total + " achievements");
+                if (minutes > 0) parts.Add(minutes < 60 ? minutes + " min" : (minutes / 60.0).ToString("0.#", CultureInfo.InvariantCulture) + " h");
+                result.Add(new GameOverview { Id = id, Name = name, Detail = string.Join("   ·   ", parts.ToArray()),
+                    Recent = Math.Max(played, date == DateTime.MinValue ? 0 : Playtime.Unix(date)),
+                    Tip = "Last synced " + (date == DateTime.MinValue ? "never" : date.ToLocalTime().ToString("g")) + "\nClick to open in Steam" });
             }
             return result.OrderByDescending(g => g.Recent).ThenBy(g => g.Text, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
@@ -1279,9 +1285,13 @@ namespace Cabinet
                 foreach (var game in Games(syncTimes))
                 {
                     string id = game.Id;
-                    menu.DropDownItems.Add(game.Text.Replace("&", "&&"), null, delegate { Process.Start("steam://nav/games/details/" + id); });
+                    // Detail goes in the right-aligned shortcut column so the numbers line up.
+                    var item = new ToolStripMenuItem(game.Name.Replace("&", "&&"), null, delegate { Process.Start("steam://nav/games/details/" + id); });
+                    item.ShortcutKeyDisplayString = game.Detail;
+                    item.ToolTipText = game.Tip;
+                    menu.DropDownItems.Add(item);
                 }
-                if (menu.DropDownItems.Count == 0) menu.DropDownItems.Add(new ToolStripMenuItem("No OnlineFix games found") { Enabled = false });
+                if (menu.DropDownItems.Count == 0) menu.DropDownItems.Add(new ToolStripMenuItem("No tracked games yet") { Enabled = false });
             }
             catch (Exception ex) { Log("overview failed: " + ex.Message); }
         }
