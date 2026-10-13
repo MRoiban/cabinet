@@ -1,0 +1,10 @@
+# Build output
+*.exe
+*.pdb
+BuildInfo.cs
+
+# Local test data and machine-specific reports (contain Steam account data / local paths)
+manual-backup/
+SHADOW-REPORT.md
+icon/DESIGN-REPORT.md
+icon/drafts/

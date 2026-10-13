@@ -1,0 +1,38 @@
+name: Build and release
+
+# Every push to main builds Cabinet.exe and publishes it as the latest release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      CABINET_VERSION: 1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: build.cmd
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $v = & .\Cabinet-cli.exe --version
+          Write-Host "Built version: $v"
+          if ("$v" -notmatch [regex]::Escape($env:CABINET_VERSION)) { throw "version mismatch: $v" }
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:CABINET_VERSION"
+          $notes = "Automatic build of ${{ github.sha }}`n`n${{ github.event.head_commit.message }}"
+          gh release create $tag Cabinet.exe --title "Cabinet $env:CABINET_VERSION" --notes "$notes" --latest
