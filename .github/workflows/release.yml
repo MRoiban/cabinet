@@ -32,7 +32,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          # Through env, never inlined: commit messages contain quotes and must not run as code.
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           $tag = "v$env:CABINET_VERSION"
-          $notes = "Automatic build of ${{ github.sha }}`n`n${{ github.event.head_commit.message }}"
+          $notes = "Automatic build of $env:GITHUB_SHA`n`n$env:COMMIT_MESSAGE"
           gh release create $tag Cabinet.exe --title "Cabinet $env:CABINET_VERSION" --notes "$notes" --latest
