@@ -41,3 +41,7 @@ export const pairingCodes = sqliteTable("pairing_codes", {
   hash: text("hash").primaryKey(), userId: text("user_id").notNull().references(() => users.id),
   createdAt: integer("created_at").notNull(), expiresAt: integer("expires_at").notNull(), usedAt: integer("used_at"),
 });
+
+export const appNames = sqliteTable("app_names", {
+  appid: text("appid").primaryKey(), name: text("name").notNull(), updatedAt: integer("updated_at").notNull(),
+});

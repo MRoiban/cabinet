@@ -16,12 +16,13 @@ function identity() {
   return { "x-bedrock-user": user, "x-bedrock-user-ts": time,
     "x-bedrock-signature": createHmac("sha256", secret).update(`${user}\n${time}`).digest("hex") };
 }
-const admin = (fields: Record<string, string>) => fetch(base + "/admin", { method: "POST", headers: { ...identity(), origin: base },
-  body: new URLSearchParams(fields), redirect: "manual" });
+// Calls a Bedrock query ("q") or mutation ("m") as a signed-in user.
+const fn = (kind: "q" | "m", name: string, args: unknown = null) => fetch(`${base}/_bedrock/${kind}/${name}`, {
+  method: "POST", headers: { ...identity(), origin: base, "content-type": "application/json" }, body: JSON.stringify(args) });
+const value = async <T = any>(response: Response | Promise<Response>): Promise<T> => ((await (await response).json()) as { value: T }).value;
+const tokenOf = (link: string) => /^\/connect#(cab_[A-Za-z0-9_-]{43})$/.exec(link)![1]!;
 async function create(name: string): Promise<string> {
-  const token = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(await (await admin({ action: "create", name })).text())?.[1];
-  if (!token) throw new Error("Admin did not display its one-time link.");
-  return token;
+  return tokenOf((await value<{ link: string }>(fn("m", "createUser", { name }))).link);
 }
 function call(path: string, options: RequestInit = {}, bearer = alice) {
   const headers = new Headers(options.headers);
@@ -77,21 +78,23 @@ test("expired, unknown and malformed codes are rejected", async () => {
   expect((await pair("nope")).status).toBe(400);
   expect((await pair((await issue()).code, { deviceName: "" })).status).toBe(400);
 });
-test("admin issues a code once and regeneration revokes paired devices", async () => {
-  const userId = ((await (await call("/api/me")).json()) as { user: { id: string } }).user.id;
-  const html = await (await admin({ action: "pair", userId })).text();
-  const code = /class="code">([0-9A-Z-]{14})</.exec(html)?.[1];
-  expect(code).toBeDefined();
-  expect(await (await fetch(base + "/admin", { headers: identity() })).text()).not.toContain(code!);
-  const { token } = await (await pair(code!)).json() as { token: string };
-  const next = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(await (await admin({ action: "regenerate", userId })).text())![1]!;
+test("admin issues a code once and a new connect link revokes paired devices", async () => {
+  const id = ((await (await call("/api/me")).json()) as { user: { id: string } }).user.id;
+  const { code, expiresAt } = await value<{ code: string; expiresAt: number }>(fn("m", "pairingCode", { id }));
+  expect(expiresAt - Date.now()).toBeGreaterThan(14 * 60 * 1000);
+  const before = await value(fn("q", "adminUser", { id }));
+  expect(JSON.stringify(before)).not.toContain(code);
+  const { token } = await (await pair(code)).json() as { token: string };
+  expect((await value(fn("q", "adminUser", { id }))).user.connections).toBe(before.user.connections + 1);
+  const next = tokenOf((await value<{ link: string }>(fn("m", "newConnectLink", { id }))).link);
   expect((await call("/api/me", {}, token)).status).toBe(401);
+  expect((await value(fn("q", "adminUser", { id }))).user.connections).toBe(1);
   alice = next;
 });
-test("the connect page can fetch codes", async () => {
+test("the connect page is the web app", async () => {
   const response = await fetch(base + "/connect");
-  expect(response.headers.get("content-security-policy")).toContain("connect-src 'self'");
-  expect(await response.text()).toContain("/api/pairing-codes");
+  expect([response.status, response.headers.get("content-type")?.split(";")[0]]).toEqual([200, "text/html"]);
+  expect(await response.text()).toContain('<div id="root">');
 });
 test("repeated failures trip the server-wide brake", async () => {
   let last = 0;

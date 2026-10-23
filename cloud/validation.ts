@@ -64,3 +64,12 @@ export function presenceBody(body: Record<string, unknown>) {
   if (/[\u007f-\u009f]/.test(name)) invalid("Invalid game name.");
   return { accountId: id, appId: body.appId, name };
 }
+
+// A minimal Standard Schema: Bedrock validates function args with it before the handler runs.
+export function args<T>(parse: (value: Record<string, unknown>) => T) {
+  return { "~standard": { version: 1 as const, vendor: "cabinet", types: undefined as unknown as { input: unknown; output: T },
+    validate(value: unknown) {
+      try { return { value: parse(record(value)) }; }
+      catch (error) { if (error instanceof BedrockError) return { issues: [{ message: error.message }] }; throw error; }
+    } } };
+}
