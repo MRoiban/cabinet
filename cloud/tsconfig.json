@@ -3,7 +3,7 @@
     "target": "ESNext", "module": "Preserve", "moduleResolution": "Bundler",
     "strict": true, "noUncheckedIndexedAccess": true, "exactOptionalPropertyTypes": true,
     "allowImportingTsExtensions": true, "verbatimModuleSyntax": true,
-    "noEmit": true, "skipLibCheck": true, "types": ["bun"]
+    "jsx": "react-jsx", "noEmit": true, "skipLibCheck": true, "types": ["bun"]
   },
-  "include": ["**/*.ts"], "exclude": ["node_modules", ".bedrock"]
+  "include": ["**/*.ts", "**/*.tsx"], "exclude": ["node_modules", ".bedrock"]
 }
