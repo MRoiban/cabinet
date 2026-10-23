@@ -103,3 +103,46 @@ must be restarted by the user. This opens a localhost-only UI debugging port
 (8080). HTTP discovery, websocket connection and receive operations have bounded
 timeouts, and every round rediscovers the target so Steam restarts need no manual
 reconnection. No extra resident process is started.
+
+## Steam Cloud file store (CloudRedirect)
+
+On Linux, CloudRedirect's `cabinet` provider keeps redirected Steam Cloud data
+in the token-user's own namespace on this server. Every Cabinet user has an
+isolated store: the bearer token selects the user, and a path never crosses users.
+Inside a user's store, CloudRedirect's own layout applies
+(`<accountId>/<appId>/blobs/<file>`, manifests and metadata), so one Cabinet user
+can sync several Steam accounts on several devices.
+
+A path is 1–1024 bytes of UTF-8 after decoding, split on `/` into nonempty
+segments of at most 255 bytes. Segments `.` and `..`, backslashes and control
+characters (U+0000–001F, U+007F) are rejected with `400`. In URLs, each segment is
+percent-encoded separately and joined with `/`. Files are opaque bytes up to
+90 MiB; each user may store at most 10 GiB (`507 {"error":"quota_exceeded"}`).
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| PUT | `/api/cloud/files/<path>` | raw bytes (`application/octet-stream`) | `FileInfo` |
+| GET | `/api/cloud/files/<path>` | | bytes, `ETag: "<sha256>"`, `Last-Modified`; `404` if absent |
+| HEAD | `/api/cloud/files/<path>` | | `200` with `ETag`/`Content-Length`, or `404`; no body |
+| DELETE | `/api/cloud/files/<path>` | | `{ "ok": true }`, also when absent |
+| GET | `/api/cloud/list?prefix=&cursor=` | | `{ "files": FileInfo[], "next": string \| null }` |
+| GET | `/api/cloud/usage` | | `{ "files", "bytes", "quota" }` |
+
+```
+FileInfo = { path, size, sha256, modifiedTime: unixSeconds }
+```
+
+- PUT replaces the file unconditionally (last write wins). An optional
+  `X-Content-SHA256: <hex>` header is verified against the body; a mismatch is `400`.
+- `list` returns files whose path starts with `prefix` (plain string prefix,
+  not percent-encoded beyond normal query encoding; empty lists everything), sorted
+  by path, at most 1000 per page. Pass `next` back as `cursor` until it is `null`.
+- Writes (PUT/DELETE) need `Origin: https://cabinet.<domain>` like every other
+  Cabinet write. Errors use the usual `{ "error": message }` envelope.
+- The admin page shows each user's file count and bytes. Revoking a token keeps
+  the files; deleting them is a manual admin action.
+
+Provider configuration on the Deck (`~/.config/CloudRedirect/`): `config.json`
+selects `"provider": "cabinet"`; the credential document (`tokens_cabinet.json` by
+default) is `{ "server": "https://cabinet.<domain>", "token": "cab_…" }`. The
+`cloud_redirect_cli cabinet-connect <connect link>` command writes both.

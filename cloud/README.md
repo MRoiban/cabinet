@@ -123,3 +123,15 @@ table and migration `0001_melodic_network` are included. See the client contract
 for validation, privacy scope, Origin headers, and Steam's optional localhost
 UI debugging port. Tests cover heartbeat upserts, cross-user reads, isolated
 deletion, TTL pruning, authentication and malformed reports.
+
+## Steam Cloud file store
+
+`/api/cloud/*` is the per-user store behind CloudRedirect's `cabinet` provider on
+Linux (see the client contract). Rows live in `cloud_files`; bytes live in the
+internal `cloud` bucket, which generic Bedrock file endpoints cannot reach, like
+`saves`. The routes are detached: bodies are read and hashed outside the
+serialized queue, and only the database and local-storage step takes a write slot.
+Each user may store 10 GiB (`CLOUD_QUOTA` in `cloud.ts`). The admin page shows file
+count and bytes per user; **Delete cloud files** removes that user's store but keeps
+the user and token. `bun test` covers path validation, isolation, replacement,
+HEAD, pagination, the blocked bucket and admin deletion.
