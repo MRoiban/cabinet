@@ -146,3 +146,34 @@ Provider configuration on the Deck (`~/.config/CloudRedirect/`): `config.json`
 selects `"provider": "cabinet"`; the credential document (`tokens_cabinet.json` by
 default) is `{ "server": "https://cabinet.<domain>", "token": "cab_…" }`. The
 `cloud_redirect_cli cabinet-connect <connect link>` command writes both.
+
+## Pairing codes
+
+A pairing code lets a device connect by typing 12 characters instead of
+pasting a connect link. The server is implied: clients default to
+`https://cabinet.mc2.onl` and only ask for a server under an advanced option.
+
+- Format: 12 characters from Crockford base32 (`0-9 A-H J K M N P-T V-Z`, no
+  `I L O U`), shown as `XXXX-XXXX-XXXX` (60 random bits). Input is case-insensitive;
+  spaces and `-` are ignored, `O` reads as `0` and `I`/`L` as `1`.
+- A code belongs to one user, is valid for **15 minutes**, works **once**, and is
+  stored only as a SHA-256 hash. Creating a new code does not revoke older ones.
+- Redeeming mints a **new token for that device**; the user's other tokens stay
+  active. **Regenerate token** in `/admin` still revokes every token of the user,
+  including paired devices.
+
+| Method | Path | Auth | Body | Response |
+|---|---|---|---|---|
+| POST | `/api/pairing-codes` | Bearer | | `{ "code": "XXXX-XXXX-XXXX", "expiresAt": unixMs }` |
+| POST | `/api/pair` | none | `{ "code", "deviceName"? }` | `{ "token": "cab_…", "user": { "id", "name" } }` |
+
+`/api/pair` errors: malformed code → `400`; unknown, used or expired code →
+`401 {"error":"invalid_code"}`; more than 30 failed attempts in the last minute
+(server-wide) → `429 {"error":"too_many_attempts"}`. Like every write it needs
+`Origin: https://cabinet.<domain>`.
+
+Codes are created by the owner in `/admin` (**Pairing code** per user, shown once)
+or by the user on `/connect#<token>` (**Get a pairing code**), so a connect link
+opened on a phone can pair a Deck without copying the link to it.
+On the Deck, `cloud_redirect_cli cabinet-connect <code> [--server <origin>]`
+redeems a code; the Decky sidebar and Lumen's Cloud Saves tab call it.

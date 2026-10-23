@@ -135,3 +135,11 @@ Each user may store 10 GiB (`CLOUD_QUOTA` in `cloud.ts`). The admin page shows f
 count and bytes per user; **Delete cloud files** removes that user's store but keeps
 the user and token. `bun test` covers path validation, isolation, replacement,
 HEAD, pagination, the blocked bucket and admin deletion.
+
+## Pairing codes
+
+`/admin` → **Pairing code** shows a one-time `XXXX-XXXX-XXXX` code for a user (also
+available to the user from their `/connect#…` page). `POST /api/pair` trades it for
+a new per-device token within 15 minutes; codes are hashed in `pairing_codes` and
+work once. A server-wide brake answers 429 after 30 failed attempts per minute.
+**Regenerate token** still revokes every token, including paired devices.

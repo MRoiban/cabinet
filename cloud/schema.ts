@@ -36,3 +36,8 @@ export const cloudFiles = sqliteTable("cloud_files", {
   fileId: text("file_id").notNull(), sha256: text("sha256").notNull(), size: integer("size").notNull(),
   updatedAt: integer("updated_at").notNull(),
 }, t => [primaryKey({ columns: [t.userId, t.path] })]);
+
+export const pairingCodes = sqliteTable("pairing_codes", {
+  hash: text("hash").primaryKey(), userId: text("user_id").notNull().references(() => users.id),
+  createdAt: integer("created_at").notNull(), expiresAt: integer("expires_at").notNull(), usedAt: integer("used_at"),
+});

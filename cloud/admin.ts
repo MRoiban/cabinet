@@ -3,6 +3,7 @@ import { creator, newToken, origin } from "./auth";
 import { tokens, users } from "./schema";
 import { allStates } from "./api";
 import { deleteAll, usage } from "./cloud";
+import { createCode } from "./pairing";
 import { escape, page } from "./pages";
 import { label, smallBody } from "./validation";
 
@@ -14,15 +15,16 @@ function gate(request: Request, ctx: FunctionContext): Response | null {
   }
   return creator(ctx) ? null : page("Cabinet Cloud", "<p>This account is not a Bedrock creator.</p>", 403);
 }
-function render(ctx: FunctionContext, token?: string): Response {
+function render(ctx: FunctionContext, token?: string, pairing?: { name: string; code: string; expiresAt: number }): Response {
+  const code = pairing ? `<section><h2>Pairing code for ${escape(pairing.name)} — shown once</h2><p>Type it on the device within 15 minutes. It works once.</p><p><code class="code">${escape(pairing.code)}</code></p><a href="/admin">Done</a></section>` : "";
   const once = token ? `<section><h2>Connect link — shown once</h2><p>Copy it now and share it with this user. Regenerate it if lost.</p><input class="link" readonly aria-label="Connect link" value="${escape(origin(ctx.request) + "/connect#" + token)}"><a href="/admin">Done</a></section>` : "";
   const rows = ctx.db.select().from(users).all().map(user => {
     const cloud = usage(ctx, user.id);
     const active = ctx.db.select().from(tokens).where(and(eq(tokens.userId, user.id), isNull(tokens.revokedAt))).all().length;
     const summaries = Object.entries(allStates(ctx, user.id)).map(([id, state]) => `<li>App ${escape(id)} · ${Object.keys(state.achievements).length} achievements · ${Object.keys(state.stats).length} stats · ${state.playtimeTotal} min · ${state.save ? `${state.save.size} bytes saved (${escape(state.save.deviceName)})` : "no save"}</li>`).join("");
-    return `<section><h2>${escape(user.name)}</h2><p>Last seen: ${user.lastSeen ? escape(new Date(user.lastSeen).toISOString()) : "Never"} · Token ${active ? "active" : "revoked"} · Steam Cloud: ${cloud.files} files, ${cloud.bytes} bytes</p><ul>${summaries || "<li>No apps yet</li>"}</ul><form method="post" action="/admin"><input type="hidden" name="userId" value="${escape(user.id)}"><button name="action" value="regenerate">Regenerate token</button><button name="action" value="revoke">Revoke token</button><button name="action" value="delete-cloud" onclick="return confirm('Delete all Steam Cloud files for this user?')">Delete cloud files</button></form></section>`;
+    return `<section><h2>${escape(user.name)}</h2><p>Last seen: ${user.lastSeen ? escape(new Date(user.lastSeen).toISOString()) : "Never"} · Token ${active ? "active" : "revoked"} · Steam Cloud: ${cloud.files} files, ${cloud.bytes} bytes</p><ul>${summaries || "<li>No apps yet</li>"}</ul><form method="post" action="/admin"><input type="hidden" name="userId" value="${escape(user.id)}"><button name="action" value="pair">Pairing code</button><button name="action" value="regenerate">Regenerate token</button><button name="action" value="revoke">Revoke token</button><button name="action" value="delete-cloud" onclick="return confirm('Delete all Steam Cloud files for this user?')">Delete cloud files</button></form></section>`;
   }).join("");
-  return page("Cabinet Cloud · Admin", `${once}<section><h2>Create user</h2><form method="post" action="/admin"><label for="name">Name</label><input id="name" name="name" maxlength="200" required><button name="action" value="create">Create user</button></form></section>${rows || "<p>No users yet.</p>"}`);
+  return page("Cabinet Cloud · Admin", `${code}${once}<section><h2>Create user</h2><form method="post" action="/admin"><label for="name">Name</label><input id="name" name="name" maxlength="200" required><button name="action" value="create">Create user</button></form></section>${rows || "<p>No users yet.</p>"}`);
 }
 export const adminRoutes: Record<string, RouteHandler> = {
   "GET /admin": (request, _server, ctx) => gate(request, ctx) ?? render(ctx),
@@ -40,6 +42,10 @@ export const adminRoutes: Record<string, RouteHandler> = {
       }
       const id = label(form.get("userId"));
       if (!ctx.db.select().from(users).where(eq(users.id, id)).get()) return page("Cabinet Cloud", "<p>User not found.</p>", 404);
+      if (action === "pair") {
+        const user = ctx.db.select().from(users).where(eq(users.id, id)).get()!;
+        return render(ctx, undefined, { name: user.name, ...createCode(ctx, id) });
+      }
       if (action === "delete-cloud") {
         await deleteAll(ctx, id);
         return render(ctx);
