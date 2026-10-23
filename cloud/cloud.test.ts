@@ -16,12 +16,13 @@ function identity() {
   return { "x-bedrock-user": user, "x-bedrock-user-ts": time,
     "x-bedrock-signature": createHmac("sha256", secret).update(`${user}\n${time}`).digest("hex") };
 }
-const admin = (fields: Record<string, string>) => fetch(base + "/admin", { method: "POST", headers: { ...identity(), origin: base },
-  body: new URLSearchParams(fields), redirect: "manual" });
+// Calls a Bedrock query ("q") or mutation ("m") as a signed-in user.
+const fn = (kind: "q" | "m", name: string, args: unknown = null) => fetch(`${base}/_bedrock/${kind}/${name}`, {
+  method: "POST", headers: { ...identity(), origin: base, "content-type": "application/json" }, body: JSON.stringify(args) });
+const value = async <T = any>(response: Response | Promise<Response>): Promise<T> => ((await (await response).json()) as { value: T }).value;
+const tokenOf = (link: string) => /^\/connect#(cab_[A-Za-z0-9_-]{43})$/.exec(link)![1]!;
 async function create(name: string): Promise<string> {
-  const token = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(await (await admin({ action: "create", name })).text())?.[1];
-  if (!token) throw new Error("Admin did not display its one-time link.");
-  return token;
+  return tokenOf((await value<{ link: string }>(fn("m", "createUser", { name }))).link);
 }
 function call(path: string, options: RequestInit = {}, bearer = alice) {
   const headers = new Headers(options.headers);
@@ -106,11 +107,15 @@ test("list filters by prefix and paginates in path order", async () => {
   const other = await (await call("/api/cloud/list?prefix=9%2F11", {}, bob)).json() as { files: { path: string }[] };
   expect(other.files.map(file => file.path)).toEqual(["9/11/blobs/other"]);
 });
-test("admin shows usage and deletes one user's cloud files", async () => {
-  const html = await (await fetch(base + "/admin", { headers: identity() })).text();
-  expect(html).toContain("Steam Cloud: 1 files, 5 bytes");
-  const response = await admin({ action: "delete-cloud", userId: await userIdOf(alice) });
-  expect(response.status).toBe(200);
+test("admin shows usage per game and deletes one user's cloud files", async () => {
+  const id = await userIdOf(alice);
+  const overview = await value(fn("q", "adminOverview"));
+  expect(overview.users.find((user: { id: string }) => user.id === id).cloud).toEqual({ files: 1, bytes: 5 });
+  const detail = await value(fn("q", "adminUser", { id }));
+  expect([detail.cloud, detail.cloudGames, detail.games]).toEqual([{ files: 1, bytes: 5 }, 1,
+    [{ appid: "480", name: null, achievements: 0, playtimeMinutes: 0, save: null, cloud: { files: 1, bytes: 5 } }]]);
+  expect(await (await call("/api/cloud/apps")).json()).toEqual({ apps: { "480": { files: 1, bytes: 5 } } });
+  expect(await value(fn("m", "deleteCloudFiles", { id }))).toEqual({ deleted: 1 });
   expect(await (await call("/api/cloud/usage")).json()).toMatchObject({ files: 0, bytes: 0 });
   expect((await call("/api/cloud/list", {}, bob)).status).toBe(200);
   expect(((await (await call("/api/cloud/usage", {}, bob)).json()) as { files: number }).files).toBe(1002);

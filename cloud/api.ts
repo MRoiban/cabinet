@@ -3,6 +3,7 @@ import { authenticate } from "./auth";
 import { apps, devices, saves, users, presence } from "./schema";
 import { emptyState, merge, progress, type AppState, type SaveMeta } from "./merge";
 import { accountId, presenceBody, appId, invalid, jsonBody, label, timestamp } from "./validation";
+import { rememberName } from "./names";
 import { MAX_SAVE, saveZips, withInternalStorage } from "./storage";
 
 const appKey = (userId: string, appid: string) => and(eq(apps.userId, userId), eq(apps.appid, appid));
@@ -44,6 +45,7 @@ export const apiRoutes: Record<string, RouteHandler> = {
   "PUT /api/presence": api(async (request, ctx, id) => {
     const values = { ...presenceBody(await jsonBody(request)), userId: id, updatedAt: Date.now() };
     ctx.db.insert(presence).values(values).onConflictDoUpdate({ target: [presence.userId, presence.accountId], set: values }).run();
+    rememberName(ctx, values.appId, values.name);
     return Response.json({ accountId: values.accountId, appId: values.appId, name: values.name, updatedAt: values.updatedAt });
   }),
   "DELETE /api/presence": api((request, ctx, id) => {

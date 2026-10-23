@@ -34,6 +34,15 @@ export function usage(ctx: FunctionContext, userId: string): { files: number; by
   return { files: row?.files ?? 0, bytes: row?.bytes ?? 0 };
 }
 
+// CloudRedirect keys files as <accountId>/<appId>/…; group a user's files by that app id.
+const rest = sql`substr(${cloudFiles.path}, instr(${cloudFiles.path}, '/') + 1)`;
+const appOfPath = sql<string>`substr(${rest}, 1, instr(${rest}, '/') - 1)`;
+export function cloudApps(ctx: FunctionContext, userId?: string): Record<string, { files: number; bytes: number }> {
+  const rows = ctx.db.select({ appid: appOfPath, files: sql<number>`count(*)`, bytes: sql<number>`coalesce(sum(${cloudFiles.size}), 0)` })
+    .from(cloudFiles).where(userId === undefined ? undefined : eq(cloudFiles.userId, userId)).groupBy(appOfPath).all();
+  return Object.fromEntries(rows.filter(row => /^\d{1,10}$/.test(row.appid)).map(({ appid, files, bytes }) => [appid, { files, bytes }]));
+}
+
 export async function deleteAll(ctx: FunctionContext, userId: string): Promise<number> {
   const rows = ctx.db.select().from(cloudFiles).where(eq(cloudFiles.userId, userId)).all();
   ctx.db.delete(cloudFiles).where(eq(cloudFiles.userId, userId)).run();
@@ -144,4 +153,6 @@ export const cloudRoutes: Record<string, DetachedRouteDefinition> = {
   }),
   "GET /api/cloud/usage": cloud(async (_request, ctx) =>
     Response.json({ ...await ctx.write(slot => usage(slot, authenticate(slot).id)), quota: CLOUD_QUOTA })),
+  "GET /api/cloud/apps": cloud(async (_request, ctx) =>
+    Response.json({ apps: await ctx.write(slot => cloudApps(slot, authenticate(slot).id)) })),
 };

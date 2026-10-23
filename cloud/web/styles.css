@@ -1,0 +1,125 @@
+/* App layout on top of Onyx (dark, comfortable). Onyx styles live in cascade layers, so these win. */
+html { color-scheme: dark; }
+body { font-family: var(--onyx-font-family); font-size: 13px; line-height: 1.5; color: var(--onyx-text-foreground); background: var(--onyx-surface-app); }
+h1, h2, h3 { margin: 0; color: var(--onyx-palette-paper); font-weight: 600; }
+h1 { font-size: 22px; line-height: 1.25; }
+h2 { font-size: 15px; }
+h3 { font-size: 13px; }
+p { margin: 0; }
+
+.cab-desc { color: var(--onyx-text-description); }
+.cab-muted { color: var(--onyx-text-muted); }
+.cab-small { font-size: 12px; }
+.cab-strong { color: var(--onyx-palette-paper); font-weight: 500; }
+.cab-mono { font-family: var(--onyx-font-mono); }
+.cab-min { min-width: 0; }
+.cab-grow { flex: 1; }
+.cab-nowrap { white-space: nowrap; }
+.cab-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cab-row-between { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cab-stack { display: flex; flex-direction: column; gap: 8px; }
+.cab-stack-lg { display: flex; flex-direction: column; gap: 16px; }
+.cab-gap-top { margin-top: 8px; }
+.cab-gap-top-lg { margin-top: 12px; }
+.cab-block { width: 100%; }
+.cab-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
+.cab-section-title { margin-bottom: 10px; }
+.cab-inline-code { color: var(--onyx-text-foreground); overflow-wrap: anywhere; }
+
+/* Shell. */
+.cab-topbar { display: flex; align-items: center; gap: 16px; height: 52px; padding: 0 20px; border-bottom: 1px solid var(--onyx-border-subtle); background: var(--onyx-surface-panel); }
+.cab-brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; color: var(--onyx-palette-paper); text-decoration: none; border-radius: 6px; }
+.cab-brand:focus-visible { outline: 2px solid var(--onyx-palette-blue-400); outline-offset: 4px; }
+.cab-logo { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; color: var(--onyx-palette-paper);
+  background: linear-gradient(135deg, var(--onyx-palette-blue-600), var(--onyx-palette-cyan-400)); }
+.cab-spacer { flex: 1; }
+.cab-page { box-sizing: border-box; width: 100%; max-width: 1120px; margin: 0 auto; padding: 28px 28px 36px; display: flex; flex-direction: column; gap: 24px; }
+.cab-portal { max-width: 880px; }
+.cab-pagehead { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.cab-avatar .onyx-avatar-fallback, .cab-avatar [data-slot="avatar-fallback"] { background: var(--cab-avatar); color: var(--onyx-palette-paper); font-weight: 700; }
+.cab-hero { display: flex; align-items: center; gap: 16px; }
+.cab-hero .cab-avatar { width: 48px; height: 48px; font-size: 15px; }
+
+/* Cards and tiles. */
+.cab-card, .cab-tile, .cab-device { padding: 20px; }
+.cab-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.cab-tile { padding: 16px; }
+.cab-tile-value { font-size: 22px; font-weight: 600; color: var(--onyx-palette-paper); margin-top: 4px; }
+.cab-table-card { padding: 16px 8px 6px; overflow-x: auto; }
+.cab-skeleton-row { display: flex; align-items: center; gap: 12px; padding: 8px 12px; }
+
+/* Playing now. */
+.cab-playing { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 2px; }
+.cab-play { display: flex; align-items: center; gap: 10px; min-width: 240px; padding: 8px 12px 8px 8px; border-radius: 10px; background: var(--onyx-surface-panel); border: 1px solid var(--onyx-border-subtle); }
+
+/* Art. */
+.cab-art { display: block; width: 100%; aspect-ratio: 460 / 215; object-fit: cover; border-radius: 4px; background: var(--onyx-surface-raised); }
+.cab-art-missing { display: grid; place-items: center; color: var(--onyx-text-muted); }
+.cab-art-sm { width: 72px; height: 34px; flex: none; }
+.cab-art-md { width: 92px; height: 43px; flex: none; }
+
+/* Users table. */
+.cab-table { width: 100%; }
+.cab-row { cursor: pointer; }
+.cab-row:focus-visible { outline: 2px solid var(--onyx-palette-blue-400); outline-offset: -2px; }
+.cab-table td { vertical-align: middle; }
+.cab-user { display: flex; align-items: center; gap: 10px; }
+.cab-user .cab-avatar { width: 28px; height: 28px; font-size: 11px; }
+.cab-num { text-align: right; font-variant-numeric: tabular-nums; }
+.cab-usage { min-width: 140px; }
+.cab-meter-sm { margin-top: 4px; }
+.cab-meter-sm .onyx-track { height: 6px; }
+.cab-meter-lg .onyx-track { height: 8px; }
+
+/* User sheet. */
+.cab-sheet[data-side="right"] { width: min(420px, 100vw); }
+.cab-sheethead { align-items: flex-start; gap: 12px; padding: 20px 20px 16px; border-bottom: 0; }
+.cab-sheet-title { font-size: 17px; font-weight: 600; color: var(--onyx-palette-paper); margin: 0; }
+.cab-sheet-body { padding: 0 20px 20px; gap: 18px; }
+.cab-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cab-games { display: flex; flex-direction: column; gap: 8px; }
+.cab-game { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 12px; align-items: center; padding: 8px; border-radius: 6px; background: var(--onyx-surface-panel); border: 1px solid var(--onyx-border-subtle); }
+.cab-facts { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--onyx-text-description); }
+
+/* Pairing code and copy fields. */
+.cab-codebox { border: 1px solid var(--onyx-border-default); border-radius: 10px; padding: 16px; background: var(--onyx-surface-app); display: flex; flex-direction: column; gap: 10px; }
+.cab-codebox-compact { padding: 12px; }
+.cab-code { font-family: var(--onyx-font-mono); font-size: 26px; letter-spacing: .12em; font-weight: 600; color: var(--onyx-palette-paper); }
+.cab-codebox-compact .cab-code { font-size: 22px; }
+.cab-code-expired { color: var(--onyx-text-muted); text-decoration: line-through; }
+.cab-timer { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--onyx-text-description); }
+.cab-timer-meter { flex: 1; }
+.cab-timer-meter .onyx-track { height: 6px; }
+.cab-copy { width: 100%; }
+.cab-dialog { display: flex; flex-direction: column; gap: 16px; }
+
+/* Connect page. */
+.cab-devices { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.cab-device { display: flex; flex-direction: column; gap: 14px; }
+.cab-device-head { display: flex; align-items: center; gap: 10px; }
+.cab-device-icon { width: 36px; height: 36px; border-radius: 6px; display: grid; place-items: center; background: var(--onyx-surface-raised); font-size: 16px; }
+.cab-steps { margin: 0; padding-left: 18px; list-style: decimal; color: var(--onyx-text-description); display: flex; flex-direction: column; gap: 2px; }
+.cab-steps kbd { margin: 0 4px; }
+.cab-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.cab-gcard { overflow: hidden; padding: 0; }
+.cab-gcard .cab-art { border-radius: 0; }
+.cab-gcard-body { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.cab-lang { flex: none; }
+
+@media (max-width: 820px) {
+  .cab-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cab-devices { grid-template-columns: 1fr; }
+  .cab-hide-narrow { display: none; }
+  .cab-page { padding: 20px 16px 28px; }
+  .cab-topbar { padding: 0 16px; }
+  .cab-sheet[data-side="right"] { width: 100vw; border-left: 0; }
+}
+@media (max-width: 520px) {
+  .cab-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cab-gcard-body { padding: 10px; }
+}
+
+/* Empty states sit inside a Card, as in the design; drop Onyx's own dashed frame there. */
+.cab-empty [data-slot="empty-state"] { border: 0; background: transparent; }
+.cab-empty [data-slot="empty-state-title"] { font-size: 15px; }
+.cab-empty [data-slot="empty-state-description"] { font-size: 13px; max-width: 460px; }

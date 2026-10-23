@@ -18,8 +18,10 @@ function check(ok: boolean, message: string): asserts ok { if (!ok) throw new Er
 async function request(path: string, options: RequestInit = {}) {
   const headers = new Headers(options.headers);
   headers.set("host", new URL(base).host);
-  if (cookie) headers.set("cookie", cookie);
-  if (bearer) headers.set("authorization", `Bearer ${bearer}`);
+  // The daemon drops Authorization when a session cookie is present: functions use the
+  // creator session, /api uses the bearer.
+  if (path.startsWith("/_bedrock/")) { if (cookie) headers.set("cookie", cookie); }
+  else if (bearer) headers.set("authorization", `Bearer ${bearer}`);
   if (options.method && options.method !== "GET") headers.set("origin", base);
   // Windows does not always resolve wildcard localhost; Host still exercises routing.
   return fetch(`http://127.0.0.1:${port}${path}`, { ...options, headers, redirect: "manual" });
@@ -39,9 +41,9 @@ try {
   }
   check(ready, "bedrock dev did not become ready.");
   check((await report("/api/me")).response.status === 401, "Anonymous API failed.");
-  const denied = await request("/admin");
-  check(denied.status === 302, "Anonymous admin must redirect.");
-  console.log(`GET /admin -> 302 ${denied.headers.get("location")}`);
+  const anonymous = await request("/_bedrock/q/adminOverview", { method: "POST", body: "null" });
+  check(anonymous.status === 401, "Anonymous admin functions must be refused.");
+  console.log("POST /_bedrock/q/adminOverview (anonymous) -> 401");
   const login = await request("/_bedrock/dev-login?return=" + encodeURIComponent(base + "/admin"), {
     method: "POST", body: new URLSearchParams({ email: "owner@example.test", name: "Owner" }),
   });
@@ -49,13 +51,16 @@ try {
   cookie = login.headers.get("set-cookie")?.split(";")[0] ?? "";
   check(!!cookie, "Dev login did not set session.");
   console.log("POST /_bedrock/dev-login -> 302 (session cookie redacted)");
-  const admin = await request("/admin"); check(admin.status === 200, "Creator admin failed.");
-  console.log("GET /admin -> 200 (signed creator)");
-  const created = await request("/admin", { method: "POST", body: new URLSearchParams({ action: "create", name: "E2E user" }) });
+  const admin = await request("/admin"); check(admin.status === 200 && (await admin.text()).includes('id="root"'), "Admin page failed.");
+  console.log("GET /admin -> 200 (web app)");
+  const overview = await request("/_bedrock/q/adminOverview", { method: "POST", body: "null" });
+  check(overview.status === 200, "Creator admin functions failed.");
+  console.log("POST /_bedrock/q/adminOverview (creator) -> 200");
+  const created = await request("/_bedrock/m/createUser", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "E2E user" }) });
   check(created.status === 200, "Create user failed.");
-  bearer = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(await created.text())?.[1] ?? "";
+  bearer = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(((await created.json()) as { value: { link: string } }).value.link)?.[1] ?? "";
   check(!!bearer, "No one-time connect link.");
-  console.log("POST /admin action=create -> 200 (one-time connect link redacted)");
+  console.log("POST /_bedrock/m/createUser -> 200 (one-time connect link and code redacted)");
   const me = await report("/api/me"); check(me.response.status === 200, "Authenticated API failed.");
   const userId = (me.value as { user: { id: string } }).user.id;
   for (const body of [
@@ -78,9 +83,9 @@ try {
   console.log(`GET /api/apps/123/save -> 200 application/zip, 22 bytes match, ETag=${hash}`);
   check((await save(499)).response.status === 409, "Conflict failed.");
   await report("/api/state");
-  const revoked = await request("/admin", { method: "POST", body: new URLSearchParams({ action: "revoke", userId }) });
+  const revoked = await request("/_bedrock/m/revokeAccess", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: userId }) });
   check(revoked.status === 200, "Revoke failed.");
-  console.log("POST /admin action=revoke -> 200");
+  console.log("POST /_bedrock/m/revokeAccess -> 200");
   check((await report("/api/me")).response.status === 401, "Revocation failed.");
   console.log("Dev HTTP E2E passed. All writes sent Origin; no raw token logged.");
 } finally {
