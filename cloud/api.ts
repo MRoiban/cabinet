@@ -3,7 +3,8 @@ import { authenticate } from "./auth";
 import { apps, devices, saves, users, presence } from "./schema";
 import { emptyState, merge, progress, type AppState, type SaveMeta } from "./merge";
 import { accountId, presenceBody, appId, invalid, jsonBody, label, timestamp } from "./validation";
-import { MAX_SAVE, saveZips, withSaveStorage } from "./storage";
+import { rememberName } from "./names";
+import { MAX_SAVE, saveZips, withInternalStorage } from "./storage";
 
 const appKey = (userId: string, appid: string) => and(eq(apps.userId, userId), eq(apps.appid, appid));
 const saveKey = (userId: string, appid: string) => and(eq(saves.userId, userId), eq(saves.appid, appid));
@@ -44,6 +45,7 @@ export const apiRoutes: Record<string, RouteHandler> = {
   "PUT /api/presence": api(async (request, ctx, id) => {
     const values = { ...presenceBody(await jsonBody(request)), userId: id, updatedAt: Date.now() };
     ctx.db.insert(presence).values(values).onConflictDoUpdate({ target: [presence.userId, presence.accountId], set: values }).run();
+    rememberName(ctx, values.appId, values.name);
     return Response.json({ accountId: values.accountId, appId: values.appId, name: values.name, updatedAt: values.updatedAt });
   }),
   "DELETE /api/presence": api((request, ctx, id) => {
@@ -98,7 +100,7 @@ export const apiRoutes: Record<string, RouteHandler> = {
     const actual = new Bun.CryptoHasher("sha256").update(await body.arrayBuffer()).digest("hex");
     if (actual !== sha256.toLowerCase()) invalid("SHA-256 does not match the upload.");
     const device = ctx.db.select().from(devices).where(and(eq(devices.userId, id), eq(devices.deviceId, deviceId))).get();
-    return withSaveStorage(ctx, async () => {
+    return withInternalStorage(ctx, async () => {
       const file = await ctx.storage.put(saveZips, body, { name: `${appid}.zip`, mime: "application/zip" });
       const values = { userId: id, appid, fileId: file.id, sha256: actual, size: file.size,
         updatedAt, deviceId, deviceName: device?.name ?? deviceId };
@@ -111,7 +113,7 @@ export const apiRoutes: Record<string, RouteHandler> = {
     const appid = appId(new URL(request.url).pathname);
     const save = ctx.db.select().from(saves).where(saveKey(id, appid)).get();
     if (!save) return Response.json({ error: "not_found" }, { status: 404 });
-    return withSaveStorage(ctx, async () => {
+    return withInternalStorage(ctx, async () => {
       const file = await ctx.storage.get(saveZips, save.fileId);
       // Capture the snapshot before the next serialized upload can delete its file.
       return new Response(await file.arrayBuffer(), {

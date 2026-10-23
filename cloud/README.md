@@ -2,7 +2,8 @@
 
 Bedrock pebble `cabinet`, served at https://cabinet.mc2.onl. Implements
 [the client contract](../docs/cloud-api.md). Data is SQLite plus a private Bedrock
-bucket; no external services or runtime packages beyond Bedrock are needed.
+bucket. The web UI (`web/`) is React 19 with Onyx through `@bedrock/ui`; the only
+external calls are Steam CDN artwork in the browser and an hourly Steam store name lookup.
 
 ## Deploy
 
@@ -11,9 +12,9 @@ Bedrock checkout is `<bedrock checkout>`. Its CLI was
 registered with `bun link` in `packages\bedrock`. Ensure
 `%USERPROFILE%\.bun\bin` is on PATH; open a new terminal after installation.
 
-Dependencies use a checkout-relative `file:` path, as Bedrock source scaffolds do.
-The deployment daemon substitutes its own Bedrock package. If moving this repo
-to another machine, update the local dependency path to that machine's checkout.
+Dependencies use `link:` packages (`bedrock`, `@bedrock/ui`), so the repo works from
+any checkout once `bun link` is registered in the Bedrock checkout; `bedrock doctor`
+checks this. React 19 (`react`, `react-dom`) must stay on matching versions.
 
 ```powershell
 cd <cabinet repo>\cloud
@@ -30,28 +31,42 @@ Migrations, including Drizzle metadata, are included and apply automatically.
 After deployment, an anonymous `GET https://cabinet.mc2.onl/api/me` must return
 `401 {"error":"unauthorized"}`.
 
-## Create users
+## Web UI and admin
+
+`pebble.ts` sets `web: "./web/index.html"`: the runtime serves the React app for every
+path that is not an API route, so `/admin` and `/connect#cab_…` are client routes.
 
 1. Open https://cabinet.mc2.onl/admin and sign in with a Bedrock creator's Google
-   account. An ordinary signed-in Google user cannot access this page.
-2. Enter the user's name and choose **Create user**.
-3. Copy the connect link immediately. It is displayed only in that admin response;
-   subsequent views cannot recover it. Share the link with its intended user.
-4. The user opens the link, then **Open in Cabinet**, or copies the link into
-   Cabinet. `/connect` supports English and French based on browser language.
+   account. Other signed-in accounts see "This account can't manage Cabinet".
+2. **New user** asks for a name, then shows a connect link and a 15-minute pairing
+   code once. Nothing can show them again; create new ones from the user instead.
+3. The user opens the link: `/connect` shows **Get a pairing code** for a Steam Deck,
+   **Open in Cabinet** (`cabinet://connect?server=…&token=…`), the link to copy, their
+   games and their Steam Cloud usage, in English or French (browser default).
 
-The admin lists users, last-seen times and per-app achievements/stats counts,
-total playtime and save sizes/device names. **Revoke token** disables access.
-**Regenerate token** revokes every prior active token and displays a new link once;
-user data is retained. Tokens are `cab_` plus 32 cryptographically random bytes
-in base64url; only SHA-256 hashes are persisted. Raw tokens are never logged.
+The admin lists users with status (active, not connected yet, revoked), active
+connections, games, playtime and Steam Cloud usage, plus who is playing now. A row
+opens the user's sheet: games with saves and cloud files, **Pairing code**, **New
+connect link** (revokes every token, including paired devices, then shows a new link
+once), **Revoke access** and **Delete cloud files…**. User data is kept on revocation.
 
-`access: "public"` still receives the daemon's HMAC-verified identity in `ctx.user`.
-Admin authorization compares that identity's email against the daemon-supplied
-`BEDROCK_CREATORS` list, case-insensitively. Missing identity redirects to Bedrock
-login; signed-in non-creators get 403. There is no development auth bypass.
-Admin POSTs require the exact public Origin, also enforced by Bedrock's daemon.
-The UI is minimal server-rendered HTML, avoiding a frontend framework dependency.
+Admin data comes from Bedrock functions in `admin.ts` (`adminOverview`, `adminUser`,
+`createUser`, `newConnectLink`, `pairingCode`, `revokeAccess`, `deleteCloudFiles`).
+Each checks the daemon-signed `ctx.user` email against `BEDROCK_CREATORS`
+(case-insensitively): anonymous calls get 401, other accounts 403 `FORBIDDEN`.
+Mutations go through the daemon's exact-Origin check. Tokens are `cab_` plus 32
+random bytes in base64url; only SHA-256 hashes are stored and raw tokens are never logged.
+
+The connect page reads the token from the URL fragment and sends it only as a
+bearer to this origin's `/api/*`, with cookies omitted (the daemon drops
+`Authorization` when a Bedrock session cookie is present). `web/index.html` sets a
+CSP allowing images from `cdn.cloudflare.steamstatic.com` only. In `bedrock dev`,
+Bun's injected hot-reload script is blocked by that CSP (a console error, no
+hot reload); production bundles have no inline scripts.
+
+Game names: presence reports store real names in `app_names`; the `appNames` job
+(hourly, detached) looks up a few missing ids per run on the Steam store and
+tolerates failures. Unknown names show as "App <id>" with the Steam header art.
 
 The save bucket uses an internal, per-handler capability: generic Bedrock upload,
 download, list and delete endpoints cannot access it, even with a creator session
@@ -79,7 +94,7 @@ Local data, sessions, and config are under ignored `.bedrock/`; tests use tempor
 directories rather than the real Bedrock home.
 
 `bun run scripts/dev-e2e.ts` starts **bedrock dev**, creates the above config when
-absent, signs in using the local login flow, creates a user via `/admin`, pushes
+absent, signs in using the local login flow, creates a user with the `createUser` function, pushes
 three progress updates, uploads/downloads a ZIP, verifies a 409 conflict and
 revokes the token. It stops the dev server afterward and redacts credentials.
 It expects the configured local creator to be `owner@example.test`, uses port
@@ -87,8 +102,10 @@ It expects the configured local creator to be `owner@example.test`, uses port
 On Windows, it connects to 127.0.0.1 with the actual Cabinet Host header, exercising
 daemon routing without relying on wildcard localhost DNS resolution.
 
-`bun test` covers merge rules, validation, creator auth, token hashing/revocation/
-regeneration, user isolation, saves, and blocked generic bucket endpoints.
+`bun test` covers merge rules, validation, the creator gate on every admin function,
+each admin mutation, token hashing/revocation/new links, user isolation, saves,
+game names, blocked generic bucket endpoints and that `/admin` and `/connect` serve
+the web app.
 
 ## Contract clarifications and client integration
 
@@ -123,3 +140,24 @@ table and migration `0001_melodic_network` are included. See the client contract
 for validation, privacy scope, Origin headers, and Steam's optional localhost
 UI debugging port. Tests cover heartbeat upserts, cross-user reads, isolated
 deletion, TTL pruning, authentication and malformed reports.
+
+## Steam Cloud file store
+
+`/api/cloud/*` is the per-user store behind CloudRedirect's `cabinet` provider on
+Linux (see the client contract). Rows live in `cloud_files`; bytes live in the
+internal `cloud` bucket, which generic Bedrock file endpoints cannot reach, like
+`saves`. The routes are detached: bodies are read and hashed outside the
+serialized queue, and only the database and local-storage step takes a write slot.
+Each user may store 10 GiB (`CLOUD_QUOTA` in `cloud.ts`). The admin shows file
+count and bytes per user and per game (CloudRedirect paths are `<accountId>/<appId>/…`);
+**Delete cloud files…** removes that user's store but keeps
+the user and token. `bun test` covers path validation, isolation, replacement,
+HEAD, pagination, the blocked bucket and admin deletion.
+
+## Pairing codes
+
+`/admin` → user → **Pairing code** shows a one-time `XXXX-XXXX-XXXX` code for a user (also
+available to the user from their `/connect#…` page). `POST /api/pair` trades it for
+a new per-device token within 15 minutes; codes are hashed in `pairing_codes` and
+work once. A server-wide brake answers 429 after 30 failed attempts per minute.
+**New connect link** still revokes every token, including paired devices.

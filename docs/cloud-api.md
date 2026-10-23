@@ -6,10 +6,11 @@ It carries saves, achievements, stats, playtime and real-game presence for Onlin
 ## Accounts and tokens
 
 - The server owner (a Bedrock creator, signed in with Google) opens `https://cabinet.<domain>/admin`,
-  creates a user by name and gets a **connect link** shown once:
+  creates a user by name and gets a **connect link** (and a pairing code) shown once:
   `https://cabinet.<domain>/connect#<token>`.
 - Tokens: `cab_` + 32 random bytes base64url. Stored hashed (SHA-256). Revocable from `/admin`.
-- `/connect` (public page) reads the token from the fragment (never sent to the server by the browser) and shows
+- `/connect` (public page, part of the pebble's web app) reads the token from the fragment (never sent to the
+  server by the browser, only used as the bearer for `/api/*` calls from that page) and shows
   an **Open in Cabinet** button linking `cabinet://connect?server=<url-encoded origin>&token=<token>`,
   plus the raw link to paste into Cabinet manually.
 - Cabinet registers the `cabinet:` URL protocol (HKCU\Software\Classes\cabinet) so the button connects in one click.
@@ -38,6 +39,7 @@ It carries saves, achievements, stats, playtime and real-game presence for Onlin
 | POST | `/api/apps/<appid>/progress` | `{ deviceId, deviceName, achievements, stats?, statsUpdatedAt?, playtimeMinutes }` | merged `AppState` |
 | PUT | `/api/apps/<appid>/save?deviceId=&updatedAt=&sha256=` | raw zip bytes (`application/zip`, max 90 MB) | `SaveMeta`, or `409 { current: SaveMeta }` |
 | GET | `/api/apps/<appid>/save` | | zip bytes, `ETag: <sha256>`; `404` if none |
+| GET | `/api/app-names?ids=<appid>,…` | | `{ "names": { "<appid>": name } }` (known names only, up to 500 ids) |
 
 ```
 AppState = {
@@ -103,3 +105,78 @@ must be restarted by the user. This opens a localhost-only UI debugging port
 (8080). HTTP discovery, websocket connection and receive operations have bounded
 timeouts, and every round rediscovers the target so Steam restarts need no manual
 reconnection. No extra resident process is started.
+
+## Steam Cloud file store (CloudRedirect)
+
+On Linux, CloudRedirect's `cabinet` provider keeps redirected Steam Cloud data
+in the token-user's own namespace on this server. Every Cabinet user has an
+isolated store: the bearer token selects the user, and a path never crosses users.
+Inside a user's store, CloudRedirect's own layout applies
+(`<accountId>/<appId>/blobs/<file>`, manifests and metadata), so one Cabinet user
+can sync several Steam accounts on several devices.
+
+A path is 1–1024 bytes of UTF-8 after decoding, split on `/` into nonempty
+segments of at most 255 bytes. Segments `.` and `..`, backslashes and control
+characters (U+0000–001F, U+007F) are rejected with `400`. In URLs, each segment is
+percent-encoded separately and joined with `/`. Files are opaque bytes up to
+90 MiB; each user may store at most 10 GiB (`507 {"error":"quota_exceeded"}`).
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| PUT | `/api/cloud/files/<path>` | raw bytes (`application/octet-stream`) | `FileInfo` |
+| GET | `/api/cloud/files/<path>` | | bytes, `ETag: "<sha256>"`, `Last-Modified`; `404` if absent |
+| HEAD | `/api/cloud/files/<path>` | | `200` with `ETag`/`Content-Length`, or `404`; no body |
+| DELETE | `/api/cloud/files/<path>` | | `{ "ok": true }`, also when absent |
+| GET | `/api/cloud/list?prefix=&cursor=` | | `{ "files": FileInfo[], "next": string \| null }` |
+| GET | `/api/cloud/usage` | | `{ "files", "bytes", "quota" }` |
+| GET | `/api/cloud/apps` | | `{ "apps": { "<appId>": { "files", "bytes" } } }` grouped by the path's second segment |
+
+```
+FileInfo = { path, size, sha256, modifiedTime: unixSeconds }
+```
+
+- PUT replaces the file unconditionally (last write wins). An optional
+  `X-Content-SHA256: <hex>` header is verified against the body; a mismatch is `400`.
+- `list` returns files whose path starts with `prefix` (plain string prefix,
+  not percent-encoded beyond normal query encoding; empty lists everything), sorted
+  by path, at most 1000 per page. Pass `next` back as `cursor` until it is `null`.
+- Writes (PUT/DELETE) need `Origin: https://cabinet.<domain>` like every other
+  Cabinet write. Errors use the usual `{ "error": message }` envelope.
+- The admin page shows each user's file count and bytes. Revoking a token keeps
+  the files; deleting them is a manual admin action.
+
+Provider configuration on the Deck (`~/.config/CloudRedirect/`): `config.json`
+selects `"provider": "cabinet"`; the credential document (`tokens_cabinet.json` by
+default) is `{ "server": "https://cabinet.<domain>", "token": "cab_…" }`. The
+`cloud_redirect_cli cabinet-connect <connect link>` command writes both.
+
+## Pairing codes
+
+A pairing code lets a device connect by typing 12 characters instead of
+pasting a connect link. The server is implied: clients default to
+`https://cabinet.mc2.onl` and only ask for a server under an advanced option.
+
+- Format: 12 characters from Crockford base32 (`0-9 A-H J K M N P-T V-Z`, no
+  `I L O U`), shown as `XXXX-XXXX-XXXX` (60 random bits). Input is case-insensitive;
+  spaces and `-` are ignored, `O` reads as `0` and `I`/`L` as `1`.
+- A code belongs to one user, is valid for **15 minutes**, works **once**, and is
+  stored only as a SHA-256 hash. Creating a new code does not revoke older ones.
+- Redeeming mints a **new token for that device**; the user's other tokens stay
+  active. **New connect link** in `/admin` still revokes every token of the user,
+  including paired devices.
+
+| Method | Path | Auth | Body | Response |
+|---|---|---|---|---|
+| POST | `/api/pairing-codes` | Bearer | | `{ "code": "XXXX-XXXX-XXXX", "expiresAt": unixMs }` |
+| POST | `/api/pair` | none | `{ "code", "deviceName"? }` | `{ "token": "cab_…", "user": { "id", "name" } }` |
+
+`/api/pair` errors: malformed code → `400`; unknown, used or expired code →
+`401 {"error":"invalid_code"}`; more than 30 failed attempts in the last minute
+(server-wide) → `429 {"error":"too_many_attempts"}`. Like every write it needs
+`Origin: https://cabinet.<domain>`.
+
+Codes are created by the owner in `/admin` (**Pairing code** in a user's sheet, shown once)
+or by the user on `/connect#<token>` (**Get a pairing code**), so a connect link
+opened on a phone can pair a Deck without copying the link to it.
+On the Deck, `cloud_redirect_cli cabinet-connect <code> [--server <origin>]`
+redeems a code; the Decky sidebar and Lumen's Cloud Saves tab call it.

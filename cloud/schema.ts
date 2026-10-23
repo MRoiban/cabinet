@@ -30,3 +30,18 @@ export const presence = sqliteTable("presence", {
   accountId: integer("account_id").notNull(), appId: text("app_id").notNull(),
   name: text("name").notNull(), updatedAt: integer("updated_at").notNull(),
 }, t => [primaryKey({ columns: [t.userId, t.accountId] })]);
+
+export const cloudFiles = sqliteTable("cloud_files", {
+  userId: text("user_id").notNull().references(() => users.id), path: text("path").notNull(),
+  fileId: text("file_id").notNull(), sha256: text("sha256").notNull(), size: integer("size").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+}, t => [primaryKey({ columns: [t.userId, t.path] })]);
+
+export const pairingCodes = sqliteTable("pairing_codes", {
+  hash: text("hash").primaryKey(), userId: text("user_id").notNull().references(() => users.id),
+  createdAt: integer("created_at").notNull(), expiresAt: integer("expires_at").notNull(), usedAt: integer("used_at"),
+});
+
+export const appNames = sqliteTable("app_names", {
+  appid: text("appid").primaryKey(), name: text("name").notNull(), updatedAt: integer("updated_at").notNull(),
+});
