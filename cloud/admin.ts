@@ -1,61 +1,90 @@
-import { and, eq, isNull, BedrockError, type FunctionContext, type RouteHandler } from "bedrock";
-import { creator, newToken, origin } from "./auth";
-import { tokens, users } from "./schema";
+import { and, eq, gte, isNull, mutation, query, BedrockError, type FunctionContext } from "bedrock";
+import { creator, newToken } from "./auth";
+import { presence, tokens, users } from "./schema";
 import { allStates } from "./api";
-import { deleteAll, usage } from "./cloud";
+import { CLOUD_QUOTA, cloudApps, deleteAll, usage } from "./cloud";
+import { namesFor } from "./names";
 import { createCode } from "./pairing";
-import { escape, page } from "./pages";
-import { label, smallBody } from "./validation";
+import { args, label } from "./validation";
 
-function gate(request: Request, ctx: FunctionContext): Response | null {
-  if (!ctx.user) {
-    const base = origin(request), url = new URL(base);
-    const login = url.hostname.endsWith(".localhost") ? `${base}/_bedrock/dev-login` : `https://auth.${url.hostname.slice("cabinet.".length)}/login`;
-    return new Response(null, { status: 302, headers: { location: `${login}?return=${encodeURIComponent(base + "/admin")}`, "cache-control": "no-store" } });
-  }
-  return creator(ctx) ? null : page("Cabinet Cloud", "<p>This account is not a Bedrock creator.</p>", 403);
+export type UserStatus = "active" | "unconnected" | "revoked";
+const PLAYING_WINDOW = 3 * 60 * 1000;
+
+function gate(ctx: FunctionContext) {
+  if (!ctx.user) throw new BedrockError("UNAUTHENTICATED", "Sign in to manage Cabinet.", "Sign in with a Bedrock creator account.");
+  if (!creator(ctx)) throw new BedrockError("FORBIDDEN", "This account can't manage Cabinet.", "Sign in with a Bedrock creator account.");
 }
-function render(ctx: FunctionContext, token?: string, pairing?: { name: string; code: string; expiresAt: number }): Response {
-  const code = pairing ? `<section><h2>Pairing code for ${escape(pairing.name)} — shown once</h2><p>Type it on the device within 15 minutes. It works once.</p><p><code class="code">${escape(pairing.code)}</code></p><a href="/admin">Done</a></section>` : "";
-  const once = token ? `<section><h2>Connect link — shown once</h2><p>Copy it now and share it with this user. Regenerate it if lost.</p><input class="link" readonly aria-label="Connect link" value="${escape(origin(ctx.request) + "/connect#" + token)}"><a href="/admin">Done</a></section>` : "";
-  const rows = ctx.db.select().from(users).all().map(user => {
-    const cloud = usage(ctx, user.id);
-    const active = ctx.db.select().from(tokens).where(and(eq(tokens.userId, user.id), isNull(tokens.revokedAt))).all().length;
-    const summaries = Object.entries(allStates(ctx, user.id)).map(([id, state]) => `<li>App ${escape(id)} · ${Object.keys(state.achievements).length} achievements · ${Object.keys(state.stats).length} stats · ${state.playtimeTotal} min · ${state.save ? `${state.save.size} bytes saved (${escape(state.save.deviceName)})` : "no save"}</li>`).join("");
-    return `<section><h2>${escape(user.name)}</h2><p>Last seen: ${user.lastSeen ? escape(new Date(user.lastSeen).toISOString()) : "Never"} · Token ${active ? "active" : "revoked"} · Steam Cloud: ${cloud.files} files, ${cloud.bytes} bytes</p><ul>${summaries || "<li>No apps yet</li>"}</ul><form method="post" action="/admin"><input type="hidden" name="userId" value="${escape(user.id)}"><button name="action" value="pair">Pairing code</button><button name="action" value="regenerate">Regenerate token</button><button name="action" value="revoke">Revoke token</button><button name="action" value="delete-cloud" onclick="return confirm('Delete all Steam Cloud files for this user?')">Delete cloud files</button></form></section>`;
-  }).join("");
-  return page("Cabinet Cloud · Admin", `${code}${once}<section><h2>Create user</h2><form method="post" action="/admin"><label for="name">Name</label><input id="name" name="name" maxlength="200" required><button name="action" value="create">Create user</button></form></section>${rows || "<p>No users yet.</p>"}`);
+function find(ctx: FunctionContext, id: string) {
+  const user = ctx.db.select().from(users).where(eq(users.id, id)).get();
+  if (!user) throw new BedrockError("USER_NOT_FOUND", "This user no longer exists.", "Reload the user list.");
+  return user;
 }
-export const adminRoutes: Record<string, RouteHandler> = {
-  "GET /admin": (request, _server, ctx) => gate(request, ctx) ?? render(ctx),
-  "POST /admin": async (request, _server, ctx) => {
-    const denied = gate(request, ctx);
-    if (denied) return denied;
-    if (request.headers.get("origin") !== origin(request)) return page("Cabinet Cloud", "<p>Invalid Origin.</p>", 403);
-    try {
-      const form = new URLSearchParams(await smallBody(request));
-      const action = form.get("action");
-      if (action === "create") {
-        const name = label(form.get("name")).trim(), id = crypto.randomUUID();
-        ctx.db.insert(users).values({ id, name, createdAt: Date.now() }).run();
-        return render(ctx, newToken(ctx, id));
-      }
-      const id = label(form.get("userId"));
-      if (!ctx.db.select().from(users).where(eq(users.id, id)).get()) return page("Cabinet Cloud", "<p>User not found.</p>", 404);
-      if (action === "pair") {
-        const user = ctx.db.select().from(users).where(eq(users.id, id)).get()!;
-        return render(ctx, undefined, { name: user.name, ...createCode(ctx, id) });
-      }
-      if (action === "delete-cloud") {
-        await deleteAll(ctx, id);
-        return render(ctx);
-      }
-      if (action !== "revoke" && action !== "regenerate") return page("Cabinet Cloud", "<p>Unknown action.</p>", 400);
-      ctx.db.update(tokens).set({ revokedAt: Date.now() }).where(and(eq(tokens.userId, id), isNull(tokens.revokedAt))).run();
-      return render(ctx, action === "regenerate" ? newToken(ctx, id) : undefined);
-    } catch (error) {
-      if (error instanceof BedrockError && error.code === "INVALID_ARGS") return page("Cabinet Cloud", `<p>${escape(error.message)}</p>`, 400);
-      throw error;
-    }
-  },
+const activeTokens = (id: string) => and(eq(tokens.userId, id), isNull(tokens.revokedAt));
+// The client prefixes location.origin; the raw token appears only in this one response.
+const connectLink = (token: string) => `/connect#${token}`;
+
+function summary(ctx: FunctionContext, user: typeof users.$inferSelect) {
+  const connections = ctx.db.select().from(tokens).where(activeTokens(user.id)).all().length;
+  const status: UserStatus = !connections ? "revoked" : user.lastSeen ? "active" : "unconnected";
+  const states = allStates(ctx, user.id), cloud = cloudApps(ctx, user.id);
+  const ids = new Set([...Object.keys(states), ...Object.keys(cloud)]);
+  return {
+    id: user.id, name: user.name, createdAt: user.createdAt, lastSeen: user.lastSeen, status, connections,
+    games: ids.size, achievements: Object.values(states).reduce((sum, state) => sum + Object.keys(state.achievements).length, 0),
+    playtimeMinutes: Object.values(states).reduce((sum, state) => sum + state.playtimeTotal, 0),
+    cloud: usage(ctx, user.id), states, cloudApps: cloud, appids: [...ids],
+  };
+}
+
+export const adminQueries = {
+  adminOverview: query(ctx => {
+    gate(ctx);
+    const rank = { active: 0, unconnected: 1, revoked: 2 };
+    const rows = ctx.db.select().from(users).all().map(user => summary(ctx, user))
+      .sort((a, b) => rank[a.status] - rank[b.status] || (b.lastSeen ?? 0) - (a.lastSeen ?? 0) || a.name.localeCompare(b.name));
+    const week = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const names = Object.fromEntries(rows.map(row => [row.id, row.name]));
+    const live = ctx.db.select().from(presence).where(gte(presence.updatedAt, Date.now() - PLAYING_WINDOW)).all();
+    return {
+      users: rows.map(({ states: _s, cloudApps: _c, appids: _a, ...row }) => row),
+      totals: {
+        users: rows.length, activeThisWeek: rows.filter(row => (row.lastSeen ?? 0) >= week).length,
+        games: new Set(rows.flatMap(row => row.appids)).size, achievements: rows.reduce((sum, row) => sum + row.achievements, 0),
+        playtimeMinutes: rows.reduce((sum, row) => sum + row.playtimeMinutes, 0),
+        cloud: { files: rows.reduce((sum, row) => sum + row.cloud.files, 0), bytes: rows.reduce((sum, row) => sum + row.cloud.bytes, 0) },
+      },
+      playing: live.map(row => ({ userId: row.userId, userName: names[row.userId] ?? "", appId: row.appId, name: row.name })),
+      quota: CLOUD_QUOTA,
+    };
+  }),
+  adminUser: query(args(body => ({ id: label(body.id) })), (ctx, { id }) => {
+    gate(ctx);
+    const { states, cloudApps: cloud, appids, ...user } = summary(ctx, find(ctx, id));
+    const names = namesFor(ctx, appids);
+    const games = appids.map(appid => ({
+      appid, name: names[appid] ?? null, achievements: Object.keys(states[appid]?.achievements ?? {}).length,
+      playtimeMinutes: states[appid]?.playtimeTotal ?? 0, save: states[appid]?.save ?? null, cloud: cloud[appid] ?? null,
+    })).sort((a, b) => b.playtimeMinutes - a.playtimeMinutes || (b.save?.updatedAt ?? 0) - (a.save?.updatedAt ?? 0));
+    return { user, games, cloud: user.cloud, cloudGames: Object.keys(cloud).length, quota: CLOUD_QUOTA };
+  }),
+};
+
+const byId = args(body => ({ id: label(body.id) }));
+function revokeAll(ctx: FunctionContext, id: string) {
+  ctx.db.update(tokens).set({ revokedAt: Date.now() }).where(activeTokens(id)).run();
+}
+export const adminMutations = {
+  createUser: mutation(args(body => ({ name: label(body.name).trim() })), (ctx, { name }) => {
+    gate(ctx);
+    const user = { id: crypto.randomUUID(), name, createdAt: Date.now(), lastSeen: null };
+    ctx.db.insert(users).values(user).run();
+    return { user, link: connectLink(newToken(ctx, user.id)), ...createCode(ctx, user.id) };
+  }),
+  newConnectLink: mutation(byId, (ctx, { id }) => {
+    gate(ctx); find(ctx, id); revokeAll(ctx, id);
+    return { link: connectLink(newToken(ctx, id)) };
+  }),
+  pairingCode: mutation(byId, (ctx, { id }) => { gate(ctx); find(ctx, id); return createCode(ctx, id); }),
+  revokeAccess: mutation(byId, (ctx, { id }) => { gate(ctx); find(ctx, id); revokeAll(ctx, id); return { ok: true }; }),
+  deleteCloudFiles: mutation(byId, async (ctx, { id }) => { gate(ctx); find(ctx, id); return { deleted: await deleteAll(ctx, id) }; }),
 };

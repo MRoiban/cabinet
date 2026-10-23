@@ -17,17 +17,13 @@ function identity(email = "owner@example.test") {
   return { "x-bedrock-user": user, "x-bedrock-user-ts": time,
     "x-bedrock-signature": createHmac("sha256", secret).update(`${user}\n${time}`).digest("hex") };
 }
-async function admin(action: string, extra: Record<string, string> = {}, email?: string) {
-  return fetch(base + "/admin", { method: "POST", headers: { ...identity(email), origin: base },
-    body: new URLSearchParams({ action, ...extra }), redirect: "manual" });
-}
+// Calls a Bedrock query ("q") or mutation ("m") as a signed-in user.
+const fn = (kind: "q" | "m", name: string, args: unknown = null, email?: string) => fetch(`${base}/_bedrock/${kind}/${name}`, {
+  method: "POST", headers: { ...identity(email), origin: base, "content-type": "application/json" }, body: JSON.stringify(args) });
+const value = async <T = any>(response: Response | Promise<Response>): Promise<T> => ((await (await response).json()) as { value: T }).value;
+const tokenOf = (link: string) => /^\/connect#(cab_[A-Za-z0-9_-]{43})$/.exec(link)![1]!;
 async function create(name: string): Promise<string> {
-  const response = await admin("create", { name });
-  if (response.status !== 200) throw new Error("Admin creation failed.");
-  const html = await response.text();
-  const value = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(html)?.[1];
-  if (!value) throw new Error("Admin did not display its one-time link.");
-  return value;
+  return tokenOf((await value<{ link: string }>(fn("m", "createUser", { name }))).link);
 }
 function call(path: string, options: RequestInit = {}, bearer = token) {
   const headers = new Headers(options.headers);
@@ -50,14 +46,10 @@ afterAll(async () => {
   if (previousSecret === undefined) delete process.env.BEDROCK_IDENTITY_SECRET; else process.env.BEDROCK_IDENTITY_SECRET = previousSecret;
   if (previousCreators === undefined) delete process.env.BEDROCK_CREATORS; else process.env.BEDROCK_CREATORS = previousCreators;
 });
-test("admin requires signed creator identity and protects writes with Origin", async () => {
-  expect((await fetch(base + "/admin", { redirect: "manual" })).status).toBe(302);
-  expect((await fetch(base + "/admin", { headers: identity("guest@example.test") })).status).toBe(403);
-  expect((await fetch(base + "/admin", { method: "POST", headers: identity(), body: "action=create&name=bad" })).status).toBe(403);
-  const html = await (await fetch(base + "/admin", { headers: identity() })).text();
-  expect(html.includes("cab_" )).toBe(false);
+test("tokens are stored only as SHA-256 hashes", () => {
   const stored = running.db.select().from(tokens).where(eq(tokens.hash, hashToken(token))).get();
   expect(stored?.hash.length).toBe(64);
+  expect(JSON.stringify(running.db.select().from(tokens).all())).not.toContain("cab_");
 });
 test("API missing, invalid and revoked tokens return exact unauthorized shape", async () => {
   for (const response of [await fetch(base + "/api/me"), await call("/api/me", {}, "invalid")]) {
@@ -66,7 +58,7 @@ test("API missing, invalid and revoked tokens return exact unauthorized shape", 
   }
   const disposable = await create("Revoked");
   const me = await (await call("/api/me", {}, disposable)).json() as { user: { id: string } };
-  await admin("revoke", { userId: me.user.id });
+  expect(await value(fn("m", "revokeAccess", { id: me.user.id }))).toEqual({ ok: true });
   expect((await call("/api/me", {}, disposable)).status).toBe(401);
 });
 test("HTTP progress merges and user isolation", async () => {
@@ -115,9 +107,7 @@ test("save upload/download, conflict, replacement and private bucket", async () 
   expect(running.db.select().from(saves).where(eq(saves.userId, userId)).get()?.fileId !== row.fileId).toBe(true);
 });
 test("regeneration invalidates old token and keeps user state", async () => {
-  const response = await admin("regenerate", { userId });
-  const next = /\/connect#(cab_[A-Za-z0-9_-]{43})/.exec(await response.text())?.[1];
-  if (!next) throw new Error("Missing regenerated connect link.");
+  const next = tokenOf((await value<{ link: string }>(fn("m", "newConnectLink", { id: userId }))).link);
   expect((await call("/api/me")).status).toBe(401);
   token = next;
   expect((await call("/api/me")).status).toBe(200);
