@@ -7,6 +7,7 @@ import { startPebble } from "bedrock/server";
 import { eq } from "bedrock";
 import { saves, tokens, presence } from "./schema";
 import { hashToken } from "./auth";
+import { sha, zipOf } from "./test-zip";
 
 let running: Awaited<ReturnType<typeof startPebble>>, temp: string, base: string;
 let token: string, userId: string;
@@ -71,7 +72,7 @@ test("HTTP progress merges and user isolation", async () => {
   await push("two", 40, 100);
   const response = await push("one", 20, 300);
   expect(await response.json()).toEqual({ achievements: { A: 100 }, stats: { score: 300 }, statsUpdatedAt: 300,
-    playtime: { one: 30, two: 40 }, playtimeTotal: 70, save: null });
+    playtime: { one: 30, two: 40 }, playtimeTotal: 70, save: null, archive: null });
   const other = await create("Other");
   expect(await (await call("/api/state", {}, other)).json()).toEqual({ apps: {} });
   expect((await call("/api/apps/123/save", {}, other)).status).toBe(404);
@@ -81,17 +82,17 @@ test("validation rejects malformed appids and JSON", async () => {
   for (const body of ["{", "[]", '{"deviceId":"a"}']) expect((await call("/api/apps/1/progress", { method: "POST", body })).status).toBe(400);
 });
 test("save upload/download, conflict, replacement and private bucket", async () => {
-  const zip = new Uint8Array(22); zip.set([0x50, 0x4b, 0x05, 0x06]);
-  const hash = new Bun.CryptoHasher("sha256").update(zip).digest("hex");
-  const upload = (time: number, sha = hash) => call(`/api/apps/123/save?deviceId=one&updatedAt=${time}&sha256=${sha}`, {
-    method: "PUT", headers: { "content-type": "application/zip" }, body: zip,
+  const zip = zipOf([{ name: "slot.dat", data: "save-A" }]);
+  const hash = sha(zip);
+  const upload = (time: number, body = zip, sha256 = sha(body), extra = "") => call(`/api/apps/123/save?deviceId=one&updatedAt=${time}&sha256=${sha256}${extra}`, {
+    method: "PUT", headers: { "content-type": "application/zip" }, body,
   });
   expect((await call("/api/apps/987/save")).status).toBe(404);
-  expect((await upload(500, "0".repeat(64))).status).toBe(400);
+  expect((await upload(500, zip, "0".repeat(64))).status).toBe(400);
   const response = await upload(500);
   expect(response.status).toBe(200);
   const meta = await response.json();
-  expect(meta).toEqual({ sha256: hash, size: 22, updatedAt: 500, deviceId: "one", deviceName: "Desktop one" });
+  expect(meta).toEqual({ sha256: hash, size: zip.length, updatedAt: 500, deviceId: "one", deviceName: "Desktop one", empty: false });
   for (const time of [499, 500]) {
     const conflict = await upload(time);
     expect(conflict.status).toBe(409);
@@ -103,8 +104,23 @@ test("save upload/download, conflict, replacement and private bucket", async () 
   const row = running.db.select().from(saves).where(eq(saves.userId, userId)).get()!;
   for (const method of ["GET", "DELETE"]) expect((await fetch(`${base}/_bedrock/files/saves/${row.fileId}`, { method, headers: identity() })).status).toBe(403);
   expect((await fetch(`${base}/_bedrock/files/saves`, { method: "POST", body: zip, headers: { "content-type": "application/zip", "x-bedrock-file-name": "x.zip", ...identity() } })).status).toBe(403);
+  // The 22-byte empty ZIP the old client uploaded for empty OnlineFix Saves folders, and a ZIP
+  // holding only a folder entry, are refused and never replace the stored backup.
+  const empty = new Uint8Array(22); empty.set([0x50, 0x4b, 0x05, 0x06]);
+  for (const body of [empty, zipOf([{ name: "Saves/", data: "" }])]) {
+    const refused = await upload(600, body);
+    expect(refused.status).toBe(422);
+    expect(await refused.json()).toEqual({ error: "empty_archive" });
+  }
+  expect((await upload(600, new TextEncoder().encode("not a zip at all, definitely"))).status).toBe(400);
+  expect(running.db.select().from(saves).where(eq(saves.userId, userId)).get()?.fileId).toBe(row.fileId);
+  expect(new Uint8Array(await (await call("/api/apps/123/save")).arrayBuffer())).toEqual(zip);
   expect((await upload(501)).status).toBe(200);
   expect(running.db.select().from(saves).where(eq(saves.userId, userId)).get()?.fileId !== row.fileId).toBe(true);
+  // An explicit allowEmpty=1 is the only way to store an empty legacy archive.
+  const allowed = await upload(700, empty, sha(empty), "&allowEmpty=1");
+  expect(allowed.status).toBe(200);
+  expect((await allowed.json()).empty).toBe(true);
 });
 test("regeneration invalidates old token and keeps user state", async () => {
   const next = tokenOf((await value<{ link: string }>(fn("m", "newConnectLink", { id: userId }))).link);

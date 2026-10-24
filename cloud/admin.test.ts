@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startPebble } from "bedrock/server";
 import { lookupName } from "./names";
+import { fetchSchema } from "./achievements";
+import { achievementSchemas, appActivity } from "./schema";
 
 let running: Awaited<ReturnType<typeof startPebble>>, temp: string, base: string;
 const previousSecret = process.env.BEDROCK_IDENTITY_SECRET, previousCreators = process.env.BEDROCK_CREATORS;
@@ -72,7 +74,8 @@ test("progress, presence names and access changes show up in the admin", async (
   expect(overview.playing).toEqual([{ userId: user.id, userName: "Marius", appId: "1245620", name: "ELDEN RING" }]);
   expect(overview.totals).toMatchObject({ users: 2, activeThisWeek: 1, games: 1, achievements: 2, playtimeMinutes: 90 });
   const detail = await value(fn("q", "adminUser", { id: user.id }));
-  expect(detail.games).toEqual([{ appid: "1245620", name: "ELDEN RING", achievements: 2, playtimeMinutes: 90, save: null, cloud: null }]);
+  expect(detail.games).toEqual([{ appid: "1245620", name: "ELDEN RING", achievements: 2, playtimeMinutes: 90, save: null, archive: null, cloud: null,
+    lastPlayed: expect.any(Number), lastSaved: null, addedAt: expect.any(Number) }]);
   expect(await (await call("/api/app-names?ids=1245620,620", token)).json()).toEqual({ names: { "1245620": "ELDEN RING" } });
   expect((await call("/api/app-names?ids=abc", token)).status).toBe(400);
   expect((await fetch(base + "/api/app-names?ids=1")).status).toBe(401);
@@ -96,4 +99,64 @@ test("store name lookups tolerate failures", async () => {
   expect(await lookupName("620", reply({ "620": { success: false } }))).toBeNull();
   expect(await lookupName("620", reply({}, 429))).toBeNull();
   expect(await lookupName("620", (async () => { throw new Error("offline"); }) as unknown as typeof fetch)).toBeNull();
+});
+
+test("games carry last played, last saved and added times for sorting", async () => {
+  const { user, link } = await value(fn("m", "createUser", { name: "Sorter" }));
+  const token = tokenOf(link);
+  const push = (appid: string, minutes: number, achievements: Record<string, number> = {}) => call(`/api/apps/${appid}/progress`, token, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "pc", deviceName: "PC", achievements, playtimeMinutes: minutes }) });
+  await push("10", 30);
+  const [first] = running.db.select().from(appActivity).all().filter(row => row.userId === user.id);
+  expect(first).toMatchObject({ appid: "10", lastPlayed: expect.any(Number) });
+  // A push without new playtime or achievements is a sync, not a play session.
+  running.db.update(appActivity).set({ lastPlayed: 1000, firstSeen: 1000 }).run();
+  await push("10", 30);
+  expect(running.db.select().from(appActivity).all().find(row => row.userId === user.id)!.lastPlayed).toBe(1000);
+  await push("10", 31);
+  expect(running.db.select().from(appActivity).all().find(row => row.userId === user.id)!.lastPlayed).toBeGreaterThan(1000);
+  // CloudRedirect uploads (<account>/<appid>/…) count as saves and as play; first sight sets "added".
+  const put = await call("/api/cloud/files/5/20/blobs/slot.sav", token, { method: "PUT", body: "save" });
+  expect(put.status).toBe(200);
+  const games = (await value(fn("q", "adminUser", { id: user.id }))).games as { appid: string; lastPlayed: number; lastSaved: number | null; addedAt: number }[];
+  const cloud = games.find(game => game.appid === "20")!, progress = games.find(game => game.appid === "10")!;
+  expect(cloud.lastSaved).toBe(cloud.lastPlayed);
+  expect(cloud.addedAt).toBeGreaterThan(progress.addedAt);
+  expect(progress.lastSaved).toBeNull();
+  expect(games.map(game => game.appid)).toEqual(["10", "20"].sort((a, b) =>
+    games.find(game => game.appid === b)!.lastPlayed - games.find(game => game.appid === a)!.lastPlayed));
+});
+test("achievements route is creator-only and merges Steam's list with unlocks", async () => {
+  const { user, link } = await value(fn("m", "createUser", { name: "Achiever" }));
+  const token = tokenOf(link);
+  await call("/api/apps/30/progress", token, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "pc", deviceName: "PC", achievements: { ACH_A: 1700000000, GONE: 1600000000 }, playtimeMinutes: 5 }) });
+  // A fresh cache means the route never calls Steam in this test.
+  running.db.insert(achievementSchemas).values({ appid: "30", fetchedAt: Date.now(), achievements: [
+    { id: "ACH_A", name: "First", description: "Do a thing", icon: `${"a".repeat(40)}.jpg`, iconGray: `${"b".repeat(40)}.jpg`, hidden: false, percent: 50 },
+    { id: "ACH_B", name: "Second", description: "Secret", icon: null, iconGray: null, hidden: true, percent: 1.5 }] }).run();
+  const path = `/api/admin/achievements?user=${user.id}&appid=30`;
+  const as = (email: string | null) => fetch(base + path, { headers: identity(email) });
+  expect([(await as(null)).status, (await as("guest@example.test")).status]).toEqual([401, 403]);
+  expect((await fetch(`${base}/api/admin/achievements?user=nope&appid=30`, { headers: identity() })).status).toBe(400);
+  expect((await fetch(`${base}/api/admin/achievements?user=${crypto.randomUUID()}&appid=30`, { headers: identity() })).status).toBe(404);
+  const body = await (await as("owner@example.test")).json() as { listed: boolean; achievements: { id: string; unlockedAt: number | null; hidden: boolean }[] };
+  expect(body.listed).toBe(true);
+  expect(body.achievements.map(({ id, unlockedAt, hidden }) => ({ id, unlockedAt, hidden }))).toEqual([
+    { id: "ACH_A", unlockedAt: 1700000000000, hidden: false },
+    { id: "ACH_B", unlockedAt: null, hidden: true },
+    { id: "GONE", unlockedAt: 1600000000000, hidden: false }]);
+});
+test("Steam achievement lists are validated and failures return null", async () => {
+  const reply = (body: unknown, status = 200) => (async () => Response.json(body, { status })) as unknown as typeof fetch;
+  const list = await fetchSchema("30", reply({ response: { achievements: [
+    { internal_name: "A", localized_name: "Alpha", localized_desc: "Desc", icon: `${"c".repeat(40)}.jpg`, icon_gray: "../evil.jpg", hidden: true, player_percent_unlocked: "12.5" },
+    { localized_name: "no id" }, { internal_name: "B", player_percent_unlocked: "x" }] } }));
+  expect(list).toEqual([
+    { id: "A", name: "Alpha", description: "Desc", icon: `${"c".repeat(40)}.jpg`, iconGray: null, hidden: true, percent: 12.5 },
+    { id: "B", name: "B", description: "", icon: null, iconGray: null, hidden: false, percent: null }]);
+  expect(await fetchSchema("30", reply({ response: {} }))).toBeNull();
+  expect(await fetchSchema("30", reply({}, 500))).toBeNull();
+  expect(await fetchSchema("30", (async () => { throw new Error("offline"); }) as unknown as typeof fetch)).toBeNull();
 });

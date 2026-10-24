@@ -4,6 +4,7 @@ import { presence, tokens, users } from "./schema";
 import { allStates } from "./api";
 import { CLOUD_QUOTA, cloudApps, deleteAll, usage } from "./cloud";
 import { namesFor } from "./names";
+import { activityFor } from "./activity";
 import { createCode } from "./pairing";
 import { args, label } from "./validation";
 
@@ -60,11 +61,19 @@ export const adminQueries = {
   adminUser: query(args(body => ({ id: label(body.id) })), (ctx, { id }) => {
     gate(ctx);
     const { states, cloudApps: cloud, appids, ...user } = summary(ctx, find(ctx, id));
-    const names = namesFor(ctx, appids);
-    const games = appids.map(appid => ({
-      appid, name: names[appid] ?? null, achievements: Object.keys(states[appid]?.achievements ?? {}).length,
-      playtimeMinutes: states[appid]?.playtimeTotal ?? 0, save: states[appid]?.save ?? null, cloud: cloud[appid] ?? null,
-    })).sort((a, b) => b.playtimeMinutes - a.playtimeMinutes || (b.save?.updatedAt ?? 0) - (a.save?.updatedAt ?? 0));
+    const names = namesFor(ctx, appids), activity = activityFor(ctx, id);
+    const games = appids.map(appid => {
+      const state = states[appid], save = state?.save ?? null, archive = state?.archive ?? null, files = cloud[appid] ?? null;
+      // Newest real save: CloudRedirect files, a format-2 archive, or a legacy ZIP that isn't empty.
+      const lastSaved = Math.max(files?.updatedAt ?? 0, archive && !archive.deleted ? archive.createdAt : 0, save && !save.empty ? save.updatedAt : 0) || null;
+      const lastUnlock = Math.max(0, ...Object.values(state?.achievements ?? {})) * 1000;
+      return {
+        appid, name: names[appid] ?? null, achievements: Object.keys(state?.achievements ?? {}).length,
+        playtimeMinutes: state?.playtimeTotal ?? 0, save, archive, cloud: files,
+        lastPlayed: Math.max(activity[appid]?.lastPlayed ?? 0, lastUnlock, lastSaved ?? 0) || null,
+        lastSaved, addedAt: activity[appid]?.firstSeen ?? null,
+      };
+    }).sort((a, b) => (b.lastPlayed ?? 0) - (a.lastPlayed ?? 0) || b.playtimeMinutes - a.playtimeMinutes);
     return { user, games, cloud: user.cloud, cloudGames: Object.keys(cloud).length, quota: CLOUD_QUOTA };
   }),
 };

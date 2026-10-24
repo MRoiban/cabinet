@@ -5,24 +5,31 @@ import { emptyState, merge, progress, type AppState, type SaveMeta } from "./mer
 import { accountId, presenceBody, appId, invalid, jsonBody, label, timestamp } from "./validation";
 import { rememberName } from "./names";
 import { MAX_SAVE, saveZips, withInternalStorage } from "./storage";
+import { newestArchive } from "./archive";
+import { saveArchives } from "./schema";
+import { fileEntryCount } from "./zip";
+import { touch } from "./activity";
 
 const appKey = (userId: string, appid: string) => and(eq(apps.userId, userId), eq(apps.appid, appid));
 const saveKey = (userId: string, appid: string) => and(eq(saves.userId, userId), eq(saves.appid, appid));
 export function saveMeta(row: typeof saves.$inferSelect): SaveMeta {
   const { sha256, size, updatedAt, deviceId, deviceName } = row;
-  return { sha256, size, updatedAt, deviceId, deviceName };
+  // Rows stored before empty uploads were refused: 22 bytes is the bare end-of-central-directory
+  // record, i.e. an archive with no entries. New rows always hold at least one file entry.
+  return { sha256, size, updatedAt, deviceId, deviceName, empty: size <= 22 };
 }
 export function appState(ctx: FunctionContext, userId: string, appid: string): AppState {
   const row = ctx.db.select().from(apps).where(appKey(userId, appid)).get();
   const save = ctx.db.select().from(saves).where(saveKey(userId, appid)).get();
   const state = row ? { achievements: row.achievements, stats: row.stats, statsUpdatedAt: row.statsUpdatedAt,
-    playtime: row.playtime, playtimeTotal: Object.values(row.playtime).reduce((a, b) => a + b, 0), save: null } : emptyState();
-  return { ...state, save: save ? saveMeta(save) : null };
+    playtime: row.playtime, playtimeTotal: Object.values(row.playtime).reduce((a, b) => a + b, 0), save: null, archive: null } : emptyState();
+  return { ...state, save: save ? saveMeta(save) : null, archive: newestArchive(ctx, userId, appid) };
 }
 export function allStates(ctx: FunctionContext, userId: string): Record<string, AppState> {
   const ids = new Set([
     ...ctx.db.select().from(apps).where(eq(apps.userId, userId)).all().map(row => row.appid),
     ...ctx.db.select().from(saves).where(eq(saves.userId, userId)).all().map(row => row.appid),
+    ...ctx.db.selectDistinct({ appid: saveArchives.appid }).from(saveArchives).where(eq(saveArchives.userId, userId)).all().map(row => row.appid),
   ]);
   return Object.fromEntries([...ids].map(id => [id, appState(ctx, userId, id)]));
 }
@@ -46,6 +53,7 @@ export const apiRoutes: Record<string, RouteHandler> = {
     const values = { ...presenceBody(await jsonBody(request)), userId: id, updatedAt: Date.now() };
     ctx.db.insert(presence).values(values).onConflictDoUpdate({ target: [presence.userId, presence.accountId], set: values }).run();
     rememberName(ctx, values.appId, values.name);
+    touch(ctx, id, values.appId, true);
     return Response.json({ accountId: values.accountId, appId: values.appId, name: values.name, updatedAt: values.updatedAt });
   }),
   "DELETE /api/presence": api((request, ctx, id) => {
@@ -74,7 +82,12 @@ export const apiRoutes: Record<string, RouteHandler> = {
   "POST /api/apps/:appid/progress": api(async (request, ctx, id) => {
     const appid = appId(new URL(request.url).pathname);
     const pushed = progress(await jsonBody(request));
-    const state = merge(appState(ctx, id, appid), pushed);
+    const stored = appState(ctx, id, appid);
+    const state = merge(stored, pushed);
+    // More playtime on this device or a new achievement means the game was played since the last push.
+    const played = pushed.playtimeMinutes > (stored.playtime[pushed.deviceId] ?? 0)
+      || Object.keys(pushed.achievements).some(key => !(key in stored.achievements));
+    touch(ctx, id, appid, played);
     const values = { userId: id, appid, achievements: state.achievements, stats: state.stats,
       statsUpdatedAt: state.statsUpdatedAt, playtime: state.playtime };
     ctx.db.insert(apps).values(values).onConflictDoUpdate({ target: [apps.userId, apps.appid], set: values }).run();
@@ -99,6 +112,11 @@ export const apiRoutes: Record<string, RouteHandler> = {
     if (!body.size || body.size > MAX_SAVE) invalid("Save must be between 1 byte and 90 MiB.");
     const actual = new Bun.CryptoHasher("sha256").update(await body.arrayBuffer()).digest("hex");
     if (actual !== sha256.toLowerCase()) invalid("SHA-256 does not match the upload.");
+    // An empty scan must never replace a backup (the OnlineFix Saves folder is often empty).
+    let entries = 0;
+    try { entries = fileEntryCount(new Uint8Array(await body.arrayBuffer())); }
+    catch (error) { if (!(error instanceof BedrockError)) throw error; invalid("Save is not a valid ZIP archive."); }
+    if (entries === 0 && url.searchParams.get("allowEmpty") !== "1") return Response.json({ error: "empty_archive" }, { status: 422 });
     const device = ctx.db.select().from(devices).where(and(eq(devices.userId, id), eq(devices.deviceId, deviceId))).get();
     return withInternalStorage(ctx, async () => {
       const file = await ctx.storage.put(saveZips, body, { name: `${appid}.zip`, mime: "application/zip" });

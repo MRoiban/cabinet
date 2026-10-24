@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "bedrock/react";
 import { Alert, AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogIcon, AlertDialogTitle,
-  Badge, Button, Icon, Meter, Sheet, SheetBody, SheetClose, SheetContent, SheetDescription, SheetHeader, SheetTitle, Skeleton, useToast } from "@bedrock/ui";
+  Badge, Button, Icon, Meter, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Sheet, SheetBody, SheetClose, SheetContent,
+  SheetDescription, SheetHeader, SheetTitle, Skeleton, useToast } from "@bedrock/ui";
+import { Achievements } from "./Achievements";
 import { CopyField } from "../components/CopyField";
 import { GameArt } from "../components/GameArt";
 import { PairingCode, pairingText } from "../components/PairingCode";
@@ -41,6 +43,7 @@ function Detail({ id }: { id: string }) {
   const [code, setCode] = useState<{ code: string; expiresAt: number } | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
+  const [game, setGame] = useState<UserDetail["games"][number] | null>(null);
   const fail = (title: string) => (cause: unknown) => toast({ title, description: cause instanceof Error ? cause.message : undefined, tone: "danger" });
   const newCode = () => pairing.mutate({ id }).then(setCode, fail("Couldn’t create a pairing code"));
   async function confirmed(kind: Confirm) {
@@ -55,6 +58,7 @@ function Detail({ id }: { id: string }) {
     {!error && <SheetBody>{[0, 1, 2].map(i => <Skeleton key={i} shape="rect" style={{ height: 59 }} />)}</SheetBody>}
   </>;
   const { user } = data;
+  if (game) return <Achievements userId={id} game={game} onBack={() => setGame(null)} close={<Close />} />;
   return <>
     <SheetHeader className="cab-sheethead">
       <UserAvatar name={user.name} seed={user.id} muted={user.status !== "active"} size="lg" />
@@ -77,13 +81,13 @@ function Detail({ id }: { id: string }) {
         <CopyField value={link} label="Copy connect link" copied="Link copied" />
         <p className="cab-desc cab-small">For a Windows PC with Cabinet, or a phone. Older links no longer work.</p>
       </div>}
-      <Games data={data} />
+      <Games data={data} onOpen={setGame} />
       <section>
         <div className="cab-row-between cab-section-title"><h3>Steam Cloud</h3><span className="cab-desc">{bytes(data.cloud.bytes)} of {bytes(data.quota)}</span></div>
         <Meter className="cab-meter-lg" tone="info" value={data.cloud.bytes} max={data.quota} aria-label={`Steam Cloud: ${bytes(data.cloud.bytes)} of ${bytes(data.quota)}`} />
         <p className="cab-desc cab-small cab-gap-top">{data.cloud.files
-          ? `${plural(data.cloud.files, "file", "files")} from ${plural(data.cloudGames, "game", "games")}, kept by CloudRedirect on Linux.`
-          : "No files yet. CloudRedirect on Linux keeps Steam Cloud saves here."}</p>
+          ? `${plural(data.cloud.files, "file", "files")} from ${plural(data.cloudGames, "game", "games")}, kept by CloudRedirect.`
+          : "No files yet. CloudRedirect keeps Steam Cloud saves here."}</p>
         {data.cloud.files > 0 && <Button size="sm" variant="destructive" className="cab-gap-top-lg" loading={wipe.isPending} onClick={() => setConfirm("delete")}><Icon name="trash" />Delete cloud files…</Button>}
       </section>
     </SheetBody>
@@ -102,20 +106,52 @@ function Close() {
   return <SheetClose asChild><Button variant="ghost" size="icon-sm" aria-label="Close"><Icon name="close" /></Button></SheetClose>;
 }
 
-function Games({ data }: { data: UserDetail }) {
+type Game = UserDetail["games"][number];
+type Sort = "played" | "saved" | "added" | "name";
+const SORTS: Record<Sort, { label: string; compare: (a: Game, b: Game) => number }> = {
+  played: { label: "Last played", compare: (a, b) => (b.lastPlayed ?? 0) - (a.lastPlayed ?? 0) },
+  saved: { label: "Last saved", compare: (a, b) => (b.lastSaved ?? 0) - (a.lastSaved ?? 0) },
+  added: { label: "Recently added", compare: (a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0) },
+  name: { label: "Name (A–Z)", compare: () => 0 },
+};
+const SORT_KEY = "cabinet.admin.gameSort";
+const byName = (a: Game, b: Game) => appName(a.appid, a.name).localeCompare(appName(b.appid, b.name), undefined, { sensitivity: "base", numeric: true });
+function savedSort(): Sort {
+  try { const value = localStorage.getItem(SORT_KEY); return value && value in SORTS ? value as Sort : "played"; } catch { return "played"; }
+}
+// The fact that matches the chosen order, so the list explains itself.
+function when(game: Game, sort: Sort): string | null {
+  if (sort === "saved") return game.lastSaved ? `Saved ${ago(game.lastSaved).toLowerCase()}` : "No save yet";
+  if (sort === "added") return game.addedAt ? `Added ${shortDate(game.addedAt)}` : null;
+  return game.lastPlayed ? `Played ${ago(game.lastPlayed).toLowerCase()}` : null;
+}
+
+function Games({ data, onOpen }: { data: UserDetail; onOpen: (game: Game) => void }) {
+  const [sort, setSort] = useState<Sort>(savedSort);
+  const choose = (value: string) => { setSort(value as Sort); try { localStorage.setItem(SORT_KEY, value); } catch { /* private mode */ } };
+  const games = [...data.games].sort((a, b) => SORTS[sort].compare(a, b) || byName(a, b));
   return <section>
-    <div className="cab-row-between cab-section-title"><h3>Games</h3><span className="cab-desc">{count(data.games.length)}</span></div>
-    {data.games.length
-      ? <div className="cab-games">{data.games.map(game => <div key={game.appid} className="cab-game">
+    <div className="cab-row-between cab-section-title">
+      <h3>Games <span className="cab-desc cab-count">{count(data.games.length)}</span></h3>
+      {data.games.length > 1 && <Select value={sort} onValueChange={choose}>
+        <SelectTrigger className="cab-sort" aria-label="Sort games"><SelectValue /></SelectTrigger>
+        <SelectContent>{(Object.keys(SORTS) as Sort[]).map(key => <SelectItem key={key} value={key}>{SORTS[key].label}</SelectItem>)}</SelectContent>
+      </Select>}
+    </div>
+    {games.length
+      ? <div className="cab-games">{games.map(game => <button type="button" key={game.appid} className="cab-game cab-game-button"
+          onClick={() => onOpen(game)} aria-label={`${appName(game.appid, game.name)}: show achievements`}>
           <GameArt appid={game.appid} className="cab-art-md" />
           <div className="cab-min"><div className="cab-strong cab-truncate">{appName(game.appid, game.name)}</div>
             <div className="cab-facts">
               {game.achievements > 0 && <span>{plural(game.achievements, "achievement", "achievements")}</span>}
               {game.playtimeMinutes > 0 && <span>{hours(game.playtimeMinutes)}</span>}
-              {game.save ? <span>Save {bytes(game.save.size)} · {game.save.deviceName} · {ago(game.save.updatedAt).toLowerCase()}</span>
-                : game.cloud && <span>Steam Cloud · {bytes(game.cloud.bytes)}</span>}
+              {when(game, sort) && <span>{when(game, sort)}</span>}
+              {game.cloud ? <span>Steam Cloud · {bytes(game.cloud.bytes)}</span>
+                : game.save && !game.save.empty && <span>Save {bytes(game.save.size)} · {game.save.deviceName}</span>}
             </div></div>
-        </div>)}</div>
+          <Icon name="chevron-right" className="cab-muted" />
+        </button>)}</div>
       : <p className="cab-desc cab-small">Nothing synced yet.</p>}
   </section>;
 }

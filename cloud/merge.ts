@@ -1,9 +1,12 @@
 import { label, numericMap, record, timestamp, invalid } from "./validation";
 
-export interface SaveMeta { sha256: string; size: number; updatedAt: number; deviceId: string; deviceName: string }
+import type { ArchiveMeta } from "./archive";
+
+// `empty`: the legacy ZIP holds no file entries (see docs/save-sync.md); never restore it.
+export interface SaveMeta { sha256: string; size: number; updatedAt: number; deviceId: string; deviceName: string; empty: boolean }
 export interface AppState {
   achievements: Record<string, number>; stats: Record<string, number>; statsUpdatedAt: number;
-  playtime: Record<string, number>; playtimeTotal: number; save: SaveMeta | null;
+  playtime: Record<string, number>; playtimeTotal: number; save: SaveMeta | null; archive: ArchiveMeta | null;
 }
 export interface Progress {
   deviceId: string; deviceName: string; achievements: Record<string, number>;
@@ -25,7 +28,7 @@ export function progress(value: unknown): Progress {
   return result;
 }
 export function emptyState(): AppState {
-  return { achievements: {}, stats: {}, statsUpdatedAt: 0, playtime: {}, playtimeTotal: 0, save: null };
+  return { achievements: {}, stats: {}, statsUpdatedAt: 0, playtime: {}, playtimeTotal: 0, save: null, archive: null };
 }
 export function merge(stored: AppState, pushed: Progress): AppState {
   const achievements = new Map(Object.entries(stored.achievements));
@@ -38,6 +41,6 @@ export function merge(stored: AppState, pushed: Progress): AppState {
   return {
     achievements: Object.fromEntries(achievements), stats: newer ? pushed.stats! : stored.stats,
     statsUpdatedAt: newer ? pushed.statsUpdatedAt! : stored.statsUpdatedAt,
-    playtime: Object.fromEntries(playtime), playtimeTotal: total, save: stored.save,
+    playtime: Object.fromEntries(playtime), playtimeTotal: total, save: stored.save, archive: stored.archive,
   };
 }

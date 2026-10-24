@@ -113,7 +113,8 @@ test("admin shows usage per game and deletes one user's cloud files", async () =
   expect(overview.users.find((user: { id: string }) => user.id === id).cloud).toEqual({ files: 1, bytes: 5 });
   const detail = await value(fn("q", "adminUser", { id }));
   expect([detail.cloud, detail.cloudGames, detail.games]).toEqual([{ files: 1, bytes: 5 }, 1,
-    [{ appid: "480", name: null, achievements: 0, playtimeMinutes: 0, save: null, cloud: { files: 1, bytes: 5 } }]]);
+    [{ appid: "480", name: null, achievements: 0, playtimeMinutes: 0, save: null, archive: null, cloud: { files: 1, bytes: 5, updatedAt: expect.any(Number) },
+      lastPlayed: expect.any(Number), lastSaved: expect.any(Number), addedAt: expect.any(Number) }]]);
   expect(await (await call("/api/cloud/apps")).json()).toEqual({ apps: { "480": { files: 1, bytes: 5 } } });
   expect(await value(fn("m", "deleteCloudFiles", { id }))).toEqual({ deleted: 1 });
   expect(await (await call("/api/cloud/usage")).json()).toMatchObject({ files: 0, bytes: 0 });
