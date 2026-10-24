@@ -50,6 +50,16 @@ opens the user's sheet: games with saves and cloud files, **Pairing code**, **Ne
 connect link** (revokes every token, including paired devices, then shows a new link
 once), **Revoke access** and **Delete cloud files…**. User data is kept on revocation.
 
+In a user's sheet, games sort by last played, last saved, recently added or name (the choice is
+remembered per browser). `app_activity` records when each game first reached Cabinet and when it
+was last played, from presence reports, progress pushes with new playtime or achievements, and
+CloudRedirect uploads; a migration backfilled older games from achievement, save and cloud-file
+times (added never earlier than the user's creation). Clicking a game shows its achievements:
+`GET /api/admin/achievements?user=<id>&appid=<id>` (creator session only) merges the user's unlock
+times with Steam's keyless `IPlayerService/GetGameAchievements` list, cached a week in
+`achievement_schemas`; a failed refresh keeps the last list, and without one only unlocks show.
+Locked hidden achievements stay collapsed until **Reveal**.
+
 Admin data comes from Bedrock functions in `admin.ts` (`adminOverview`, `adminUser`,
 `createUser`, `newConnectLink`, `pairingCode`, `revokeAccess`, `deleteCloudFiles`).
 Each checks the daemon-signed `ctx.user` email against `BEDROCK_CREATORS`

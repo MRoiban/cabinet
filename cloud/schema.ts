@@ -54,3 +54,18 @@ export const saveArchives = sqliteTable("save_archives", {
   createdAt: integer("created_at").notNull(), deviceId: text("device_id").notNull(), deviceName: text("device_name").notNull(),
   baseHash: text("base_hash"), deleted: integer("deleted").notNull().default(0),
 }, t => [index("save_archives_user_app_created").on(t.userId, t.appid, t.createdAt)]);
+
+// When a game first reached Cabinet and when it was last played, recorded from presence,
+// progress and CloudRedirect uploads. Games older than this table fall back to derived times.
+export const appActivity = sqliteTable("app_activity", {
+  userId: text("user_id").notNull().references(() => users.id), appid: text("appid").notNull(),
+  firstSeen: integer("first_seen").notNull(), lastPlayed: integer("last_played"),
+}, t => [primaryKey({ columns: [t.userId, t.appid] })]);
+
+// Steam's public achievement list per game (IPlayerService/GetGameAchievements), cached weekly.
+export const achievementSchemas = sqliteTable("achievement_schemas", {
+  appid: text("appid").primaryKey(),
+  achievements: text("achievements", { mode: "json" }).$type<SchemaAchievement[]>().notNull(),
+  fetchedAt: integer("fetched_at").notNull(),
+});
+export type SchemaAchievement = { id: string; name: string; description: string; icon: string | null; iconGray: string | null; hidden: boolean; percent: number | null };

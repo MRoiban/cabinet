@@ -8,6 +8,7 @@ import { MAX_SAVE, saveZips, withInternalStorage } from "./storage";
 import { newestArchive } from "./archive";
 import { saveArchives } from "./schema";
 import { fileEntryCount } from "./zip";
+import { touch } from "./activity";
 
 const appKey = (userId: string, appid: string) => and(eq(apps.userId, userId), eq(apps.appid, appid));
 const saveKey = (userId: string, appid: string) => and(eq(saves.userId, userId), eq(saves.appid, appid));
@@ -52,6 +53,7 @@ export const apiRoutes: Record<string, RouteHandler> = {
     const values = { ...presenceBody(await jsonBody(request)), userId: id, updatedAt: Date.now() };
     ctx.db.insert(presence).values(values).onConflictDoUpdate({ target: [presence.userId, presence.accountId], set: values }).run();
     rememberName(ctx, values.appId, values.name);
+    touch(ctx, id, values.appId, true);
     return Response.json({ accountId: values.accountId, appId: values.appId, name: values.name, updatedAt: values.updatedAt });
   }),
   "DELETE /api/presence": api((request, ctx, id) => {
@@ -80,7 +82,12 @@ export const apiRoutes: Record<string, RouteHandler> = {
   "POST /api/apps/:appid/progress": api(async (request, ctx, id) => {
     const appid = appId(new URL(request.url).pathname);
     const pushed = progress(await jsonBody(request));
-    const state = merge(appState(ctx, id, appid), pushed);
+    const stored = appState(ctx, id, appid);
+    const state = merge(stored, pushed);
+    // More playtime on this device or a new achievement means the game was played since the last push.
+    const played = pushed.playtimeMinutes > (stored.playtime[pushed.deviceId] ?? 0)
+      || Object.keys(pushed.achievements).some(key => !(key in stored.achievements));
+    touch(ctx, id, appid, played);
     const values = { userId: id, appid, achievements: state.achievements, stats: state.stats,
       statsUpdatedAt: state.statsUpdatedAt, playtime: state.playtime };
     ctx.db.insert(apps).values(values).onConflictDoUpdate({ target: [apps.userId, apps.appid], set: values }).run();

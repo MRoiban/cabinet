@@ -3,6 +3,7 @@ import { authenticate } from "./auth";
 import { cloudFiles } from "./schema";
 import { MAX_CLOUD_FILE, cloudBlobs, withInternalStorage } from "./storage";
 import { invalid } from "./validation";
+import { appOfCloudPath, touch } from "./activity";
 
 export const CLOUD_QUOTA = 10 * 1024 * 1024 * 1024;
 const PAGE = 1000;
@@ -37,10 +38,11 @@ export function usage(ctx: FunctionContext, userId: string): { files: number; by
 // CloudRedirect keys files as <accountId>/<appId>/…; group a user's files by that app id.
 const rest = sql`substr(${cloudFiles.path}, instr(${cloudFiles.path}, '/') + 1)`;
 const appOfPath = sql<string>`substr(${rest}, 1, instr(${rest}, '/') - 1)`;
-export function cloudApps(ctx: FunctionContext, userId?: string): Record<string, { files: number; bytes: number }> {
-  const rows = ctx.db.select({ appid: appOfPath, files: sql<number>`count(*)`, bytes: sql<number>`coalesce(sum(${cloudFiles.size}), 0)` })
+export function cloudApps(ctx: FunctionContext, userId?: string): Record<string, { files: number; bytes: number; updatedAt: number }> {
+  const rows = ctx.db.select({ appid: appOfPath, files: sql<number>`count(*)`, bytes: sql<number>`coalesce(sum(${cloudFiles.size}), 0)`,
+    updatedAt: sql<number>`coalesce(max(${cloudFiles.updatedAt}), 0)` })
     .from(cloudFiles).where(userId === undefined ? undefined : eq(cloudFiles.userId, userId)).groupBy(appOfPath).all();
-  return Object.fromEntries(rows.filter(row => /^\d{1,10}$/.test(row.appid)).map(({ appid, files, bytes }) => [appid, { files, bytes }]));
+  return Object.fromEntries(rows.filter(row => /^\d{1,10}$/.test(row.appid)).map(({ appid, files, bytes, updatedAt }) => [appid, { files, bytes, updatedAt }]));
 }
 
 export async function deleteAll(ctx: FunctionContext, userId: string): Promise<number> {
@@ -106,6 +108,9 @@ export const cloudRoutes: Record<string, DetachedRouteDefinition> = {
         const file = await slot.storage.put(cloudBlobs, new Blob([body]), { name: path.split("/").pop()!, mime: "application/octet-stream" });
         const values = { userId, path, fileId: file.id, sha256, size: body.length, updatedAt: Date.now() };
         slot.db.insert(cloudFiles).values(values).onConflictDoUpdate({ target: [cloudFiles.userId, cloudFiles.path], set: values }).run();
+        // Steam uploads cloud files when a game exits.
+        const appid = appOfCloudPath(path);
+        if (appid) touch(slot, userId, appid, true, values.updatedAt);
         if (current) await slot.storage.delete(cloudBlobs, current.fileId);
         return values;
       });
@@ -154,5 +159,6 @@ export const cloudRoutes: Record<string, DetachedRouteDefinition> = {
   "GET /api/cloud/usage": cloud(async (_request, ctx) =>
     Response.json({ ...await ctx.write(slot => usage(slot, authenticate(slot).id)), quota: CLOUD_QUOTA })),
   "GET /api/cloud/apps": cloud(async (_request, ctx) =>
-    Response.json({ apps: await ctx.write(slot => cloudApps(slot, authenticate(slot).id)) })),
+    Response.json({ apps: Object.fromEntries(Object.entries(await ctx.write(slot => cloudApps(slot, authenticate(slot).id)))
+      .map(([appid, { files, bytes }]) => [appid, { files, bytes }])) })),
 };
