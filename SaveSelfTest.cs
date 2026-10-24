@@ -139,7 +139,7 @@ Odd Entry:
         static SaveSync NewSync(string data, SaveEnvironment env, SaveManifestIndex index)
         {
             var sync = new SaveSync(data, delegate(string s) { Console.WriteLine("LOG: " + s); }, delegate { return env; });
-            sync.Manifest.Use(index); sync.GameRunning = delegate { return false; }; sync.UseAccount("http://fake", "user");
+            sync.Manifest.Use(index); sync.GameRunning = delegate { return false; }; sync.UseAccount("http://fake", "user"); sync.Device = Path.GetFileName(Path.GetDirectoryName(data));
             return sync;
         }
 
@@ -535,6 +535,15 @@ Odd Entry:
             var bBackup = Directory.GetFiles(Path.Combine(root, "s2", "data", "backup", "saves", "1139980")).OrderBy(x => x).Last();
             Check(Read(SaveArchive.Read(File.ReadAllBytes(bBackup), "steam:1139980"), "GameSaves/File_1/s.save") == "b2", "the replaced local version is in the local backup");
 
+            // This PC's own backup never auto-restores into an empty folder (it may be a deliberate delete).
+            var own = Env(Path.Combine(root, "s4"), "Own"); var so = NewSync(Path.Combine(root, "s4", "data"), own, index);
+            var ownCloud = new FakeSaveCloud(); Put(Path.Combine(own.LocalLow, "Louqou", "TravellersRest", "GameSaves", "x.save"), "mine");
+            so.Sync("1139980", null, null, ownCloud.As(so.Device), idle, own, true);
+            File.Delete(Path.Combine(own.LocalLow, "Louqou", "TravellersRest", "GameSaves", "x.save"));
+            File.Delete(Path.Combine(root, "s4", "data", "save-state.json")); var fresh = NewSync(Path.Combine(root, "s4", "data"), own, index);
+            fresh.Sync("1139980", ownCloud.Current("1139980"), null, ownCloud, idle, own, true);
+            Check(!File.Exists(Path.Combine(own.LocalLow, "Louqou", "TravellersRest", "GameSaves", "x.save")) && fresh.StatusOf("1139980").Status == SaveSyncStatus.LocalMissing, "own backup over an empty folder waits for an explicit restore");
+
             // Empty scan after a sync: the cloud copy stays; status is localMissing.
             Directory.Delete(ga, true); Directory.CreateDirectory(ga); puts = cloud.Puts;
             sa.Sync("1139980", cloud.Current("1139980"), null, cloud.As("A"), idle, a, true);
@@ -553,6 +562,9 @@ Odd Entry:
             cloud.Legacy["778"] = new byte[] { 0x50, 0x4b, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
             Directory.CreateDirectory(Path.Combine(c.OnlineFixRoot, "778", "Saves"));
             var legacyMeta = new SaveLegacyMeta { Sha256 = SaveUtil.Sha256(cloud.Legacy["777"]), Size = cloud.Legacy["777"].Length, DeviceId = "old" };
+            cloud.Legacy["776"] = Zip("slot.dat", "my-old-legacy"); Directory.CreateDirectory(Path.Combine(c.OnlineFixRoot, "776", "Saves"));
+            sc.Sync("776", null, new SaveLegacyMeta { Sha256 = SaveUtil.Sha256(cloud.Legacy["776"]), Size = 200, DeviceId = sc.Device }, cloud, idle, c, true);
+            Check(!File.Exists(Path.Combine(c.OnlineFixRoot, "776", "Saves", "slot.dat")) && sc.StatusOf("776").Status == SaveSyncStatus.LocalMissing, "this PC's own legacy backup is offered, not restored automatically");
             sc.Sync("777", null, legacyMeta, cloud.As("C"), idle, c, true);
             Check(File.ReadAllText(Path.Combine(c.OnlineFixRoot, "777", "Saves", "slot.dat")) == "legacy-save", "existing Cabinet backups stay usable");
             sc.Sync("777", null, legacyMeta, cloud, idle, c, true);

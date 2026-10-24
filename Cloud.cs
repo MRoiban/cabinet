@@ -49,6 +49,7 @@ namespace Cabinet
         static readonly Queue<Action<CloudClient>> saveActions = new Queue<Action<CloudClient>>();
         internal static SaveSync Saves { get { return Client.Saves; } }
         internal static void RequestRescan() { rescan = true; }
+        internal static Func<string, bool> BlockedApp { get { return Blocked; } }
         // Runs on the cloud worker thread, between rounds; the action reports its own result.
         internal static void QueueSaveAction(Action<CloudClient> action) { lock (saveActions) saveActions.Enqueue(action); }
         static bool TakeSaveAction(out Action<CloudClient> action)
@@ -459,6 +460,7 @@ namespace Cabinet
         public string UserName { get { return settings.userName ?? settings.deviceName; } }
         public bool Connected { get { return !string.IsNullOrEmpty(settings.token); } }
         internal string Device { get { return settings.deviceId; } }
+        internal string UserId { get { return settings.userId; } }
         internal CloudClient(string data, string root, Func<string, long> getMinutes, Action<string> logger)
         {
             Data = data; Root = root; minutes = getMinutes; log = logger; Directory.CreateDirectory(Data);
@@ -633,7 +635,7 @@ namespace Cabinet
         // backups of games installed here. See docs/save-sync.md.
         internal void SyncSaves(Dictionary<string, object> state, Func<string, bool> blocked)
         {
-            Saves.UseAccount(settings.server, settings.userId);
+            Saves.UseAccount(settings.server, settings.userId); Saves.Device = Device;
             Saves.Manifest.Refresh(false);
             var env = Saves.CurrentEnvironment(true);
             var eligible = new HashSet<string>(Saves.Eligible(env));

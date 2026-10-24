@@ -123,6 +123,7 @@ namespace Cabinet
         internal Func<SaveEnvironment> EnvironmentProvider;
         internal Func<string, SaveEnvironment, bool> GameRunning = DefaultRunning;
         internal bool AutoRestore = true;
+        internal string Device;   // this install's Cabinet device id
         readonly object gate = new object();
         readonly string statePath; SaveStateFile state = new SaveStateFile(); string account = "local";
         readonly Dictionary<string, SaveGameStatus> view = new Dictionary<string, SaveGameStatus>();
@@ -273,12 +274,14 @@ namespace Cabinet
                 bool cloudContent = cloud != null && !cloud.Deleted && cloud.Files > 0;
                 bool restorable = d.Status == SaveStatus.Empty || d.Status == SaveStatus.Missing;
                 bool fresh = a.contentHash == null || a.contentHash == SaveArchive.EmptyContentHash;
-                if (cloudContent && fresh && restorable && AutoRestore)
+                // Only another PC's backup restores into an empty folder automatically; this PC's own
+                // backup over an empty folder may undo a deliberate deletion, so it waits for the user.
+                if (cloudContent && fresh && restorable && AutoRestore && (cloud.DeviceId == null || cloud.DeviceId != Device))
                 {
                     RestoreCloud(appid, cloud.Id, cloud, api, blocked, env, "first sync on this PC, no local saves");
                     return;
                 }
-                if (cloud == null && legacy != null && !legacy.Empty && a.contentHash == null && restorable && AutoRestore && legacy.Sha256 != a.legacySha)
+                if (cloud == null && legacy != null && !legacy.Empty && a.contentHash == null && restorable && AutoRestore && legacy.Sha256 != a.legacySha && (legacy.DeviceId == null || legacy.DeviceId != Device))
                 {
                     RestoreLegacy(appid, legacy, api, blocked, env);
                     return;
@@ -286,6 +289,7 @@ namespace Cabinet
                 string status;
                 if (cloud != null && cloud.Deleted) status = SaveSyncStatus.CloudDeleted;
                 else if (cloudContent && !fresh && a.contentHash != cloud.ContentHash) { status = SaveSyncStatus.Conflict; a.conflictCloud = cloud.ContentHash; a.conflictLocal = SaveArchive.EmptyContentHash; a.conflictAt = SaveUtil.Now(); }
+                else if ((cloudContent && fresh) || (cloud == null && legacy != null && !legacy.Empty && legacy.Sha256 != a.legacySha)) status = SaveSyncStatus.LocalMissing;
                 else status = MapDiscovery(d, a);
                 Publish(appid, d, a, cloud, true, status, null);
                 SaveState();
