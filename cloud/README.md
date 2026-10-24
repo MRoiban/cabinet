@@ -161,3 +161,26 @@ available to the user from their `/connect#…` page). `POST /api/pair` trades i
 a new per-device token within 15 minutes; codes are hashed in `pairing_codes` and
 work once. A server-wide brake answers 429 after 30 failed attempts per minute.
 **New connect link** still revokes every token, including paired devices.
+
+## Versioned saves (format 2)
+
+`/api/apps/:appid/archive(s)` (`archive.ts`) stores every save version as a row in
+`save_archives` (migration `20261024101820_save_archives`) and a blob in the internal
+`archives` bucket, which generic Bedrock file endpoints cannot reach, like `saves`.
+The server validates the archive without extracting saves (`zip.ts`): the first entry
+must be `cabinet-save.json` (stored, or deflated for .NET Framework clients), the
+content hash is recomputed from its file list, the file entries must match the list
+exactly and every path must be a safe relative Windows path. Empty archives are
+refused (`422 empty_archive`) unless `intent=delete` records a tombstone; writes
+must name the content they replace (`base`) or get `409`. The newest 10 versions per
+user and game are kept; older rows and blobs are deleted after the commit. The routes
+are detached: bodies are read and checked outside the write queue.
+
+The legacy `/save` route refuses ZIPs with no file entries (`422 empty_archive`,
+override with `allowEmpty=1`) and non-ZIP bodies (400). `SaveMeta.empty` marks
+stored legacy rows of 22 bytes (an archive with no entries): before this change the
+client uploaded such ZIPs for empty OnlineFix `Saves` folders. See
+[`docs/save-sync.md`](../docs/save-sync.md) for the format, the client rules and
+the deploy order. `bun test` covers uploads, history, idempotent retries, 409s,
+tombstones, retention with blob deletion, malformed archives and paths, user
+isolation and the legacy refusal.

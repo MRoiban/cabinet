@@ -63,7 +63,7 @@ export const adminQueries = {
     const names = namesFor(ctx, appids);
     const games = appids.map(appid => ({
       appid, name: names[appid] ?? null, achievements: Object.keys(states[appid]?.achievements ?? {}).length,
-      playtimeMinutes: states[appid]?.playtimeTotal ?? 0, save: states[appid]?.save ?? null, cloud: cloud[appid] ?? null,
+      playtimeMinutes: states[appid]?.playtimeTotal ?? 0, save: states[appid]?.save ?? null, archive: states[appid]?.archive ?? null, cloud: cloud[appid] ?? null,
     })).sort((a, b) => b.playtimeMinutes - a.playtimeMinutes || (b.save?.updatedAt ?? 0) - (a.save?.updatedAt ?? 0));
     return { user, games, cloud: user.cloud, cloudGames: Object.keys(cloud).length, quota: CLOUD_QUOTA };
   }),

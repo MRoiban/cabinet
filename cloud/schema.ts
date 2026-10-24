@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, primaryKey } from "bedrock";
+import { sqliteTable, text, integer, primaryKey, index } from "bedrock";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(), name: text("name").notNull(),
@@ -45,3 +45,12 @@ export const pairingCodes = sqliteTable("pairing_codes", {
 export const appNames = sqliteTable("app_names", {
   appid: text("appid").primaryKey(), name: text("name").notNull(), updatedAt: integer("updated_at").notNull(),
 });
+
+// Format-2 save archives: every version is a row; the newest is current (docs/save-sync.md).
+export const saveArchives = sqliteTable("save_archives", {
+  id: text("id").primaryKey(), userId: text("user_id").notNull().references(() => users.id), appid: text("appid").notNull(),
+  fileId: text("file_id").notNull(), sha256: text("sha256").notNull(), contentHash: text("content_hash").notNull(),
+  size: integer("size").notNull(), files: integer("files").notNull(), bytes: integer("bytes").notNull(),
+  createdAt: integer("created_at").notNull(), deviceId: text("device_id").notNull(), deviceName: text("device_name").notNull(),
+  baseHash: text("base_hash"), deleted: integer("deleted").notNull().default(0),
+}, t => [index("save_archives_user_app_created").on(t.userId, t.appid, t.createdAt)]);

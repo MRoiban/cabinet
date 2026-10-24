@@ -72,7 +72,7 @@ test("progress, presence names and access changes show up in the admin", async (
   expect(overview.playing).toEqual([{ userId: user.id, userName: "Marius", appId: "1245620", name: "ELDEN RING" }]);
   expect(overview.totals).toMatchObject({ users: 2, activeThisWeek: 1, games: 1, achievements: 2, playtimeMinutes: 90 });
   const detail = await value(fn("q", "adminUser", { id: user.id }));
-  expect(detail.games).toEqual([{ appid: "1245620", name: "ELDEN RING", achievements: 2, playtimeMinutes: 90, save: null, cloud: null }]);
+  expect(detail.games).toEqual([{ appid: "1245620", name: "ELDEN RING", achievements: 2, playtimeMinutes: 90, save: null, archive: null, cloud: null }]);
   expect(await (await call("/api/app-names?ids=1245620,620", token)).json()).toEqual({ names: { "1245620": "ELDEN RING" } });
   expect((await call("/api/app-names?ids=abc", token)).status).toBe(400);
   expect((await fetch(base + "/api/app-names?ids=1")).status).toBe(401);

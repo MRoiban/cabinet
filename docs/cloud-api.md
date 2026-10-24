@@ -24,8 +24,14 @@ It carries saves, achievements, stats, playtime and real-game presence for Onlin
 - **Stats**: `{ "<name>": number }` replaced as a whole when the pushed `statsUpdatedAt` (unix ms) is newer.
 - **Playtime**: per device, `playtime[deviceId] = max(stored, pushed)` where pushed is that device's own
   total minutes for the app. Total = sum over devices.
-- **Save**: one current snapshot per app (zip of the game's OnlineFix `Saves` folder). Newer `updatedAt` (unix ms)
-  wins; an older upload returns `409` with the current meta. The client keeps a local backup before replacing saves.
+- **Save (format 2, current clients)**: versioned archives per app (`/archive`, see [save-sync.md](save-sync.md)).
+  A write must name the content it replaces (`base`); otherwise `409` with the current version. The same content
+  again returns the current version. An archive with no files is refused (`422 empty_archive`) unless it is an
+  explicit `intent=delete` tombstone. The newest 10 versions are kept. The client keeps a local backup before
+  replacing saves.
+- **Save (legacy, older clients)**: one snapshot per app (zip of the game's OnlineFix `Saves` folder). Newer
+  `updatedAt` (unix ms) wins; an older upload returns `409` with the current meta. A ZIP with no file entries is
+  refused with `422 {"error":"empty_archive"}` unless `allowEmpty=1`; a body that is not a ZIP is `400`.
 
 ## Endpoints (JSON unless noted)
 
@@ -39,6 +45,9 @@ It carries saves, achievements, stats, playtime and real-game presence for Onlin
 | POST | `/api/apps/<appid>/progress` | `{ deviceId, deviceName, achievements, stats?, statsUpdatedAt?, playtimeMinutes }` | merged `AppState` |
 | PUT | `/api/apps/<appid>/save?deviceId=&updatedAt=&sha256=` | raw zip bytes (`application/zip`, max 90 MB) | `SaveMeta`, or `409 { current: SaveMeta }` |
 | GET | `/api/apps/<appid>/save` | | zip bytes, `ETag: <sha256>`; `404` if none |
+| PUT | `/api/apps/<appid>/archive?deviceId=&sha256=&contentHash=&files=&bytes=&base=[&intent=delete]` | format-2 zip (`application/zip`, max 90 MiB) | `ArchiveMeta`; `409 { current: ArchiveMeta }`; `422 { error: "empty_archive" }`; `404` for a delete with nothing stored |
+| GET | `/api/apps/<appid>/archive[?id=<versionId>]` | | zip bytes, `ETag: <sha256>`, `X-Cabinet-Archive-Id`; `404` if none |
+| GET | `/api/apps/<appid>/archives` | | `{ "versions": ArchiveMeta[] }`, newest first |
 | GET | `/api/app-names?ids=<appid>,…` | | `{ "names": { "<appid>": name } }` (known names only, up to 500 ids) |
 
 ```
@@ -46,9 +55,11 @@ AppState = {
   achievements: { [apiName]: unixSeconds },
   stats: { [name]: number }, statsUpdatedAt: unixMs | 0,
   playtime: { [deviceId]: minutes }, playtimeTotal: minutes,
-  save: SaveMeta | null
+  save: SaveMeta | null,
+  archive: ArchiveMeta | null          // newest format-2 version (may be a tombstone)
 }
-SaveMeta = { sha256, size, updatedAt: unixMs, deviceId, deviceName }
+SaveMeta = { sha256, size, updatedAt: unixMs, deviceId, deviceName, empty }   // empty: no file entries, never restore
+ArchiveMeta = { id, sha256, contentHash, size, files, bytes, createdAt: unixMs, deviceId, deviceName, deleted }
 ```
 
 `<appid>` is digits only (`^\d{1,10}$`), else `400`. `deviceId` is a stable random id per Cabinet install.
