@@ -78,7 +78,20 @@ one status:
 | `ambiguous` | one logical root matched several folders that hold files (e.g. two Steam users) |
 | `unsupported` | no usable Windows save rule (no manifest entry, registry-only, manifest unavailable) |
 
-Only `found` can upload. An empty OnlineFix `Saves` folder never uploads.
+Only `found` can upload. An empty OnlineFix `Saves` folder never uploads. When only fallback roots
+(OnlineFix, overrides) are missing and the manifest has no usable rule, the status is
+`unsupported`, not `missing`: the real location is unknown.
+
+### Which games sync automatically
+
+Discovery runs for every *eligible* game: an OnlineFix folder, a LuaTools/SteamTools lua
+(`<Steam>/config/stplug-in/<appid>.lua`) or an override. An override can switch a game off
+(`"sync": false`). A game that is only installed here (Steam `appmanifest`) but has a cloud backup
+is also eligible, so a second PC restores it. Other installed games are not scanned.
+
+Running games: besides Cabinet's OnlineFix detection, a game counts as running while Steam's
+`HKCU\Software\Valve\Steam\Apps\<appid>\Running` is set or a process runs from its install
+folder. A sync deferred for that reason runs as soon as the game exits.
 
 ## Manifest cache
 
@@ -217,6 +230,21 @@ before a manual restore.
 5. Check that the game is still not running, then replace files one by one and delete local files
    that the archive does not contain (they are in the backup).
 6. On any failure while committing, put the backup back and remove the staged files.
+
+## Command line and tests
+
+`Cabinet-cli.exe` (read-only, for review on a real PC; `dataDir` only receives the manifest cache):
+
+```
+Cabinet-cli.exe --saves-discover <appid> [dataDir]
+Cabinet-cli.exe --saves-snapshot <appid> <out.zip> [dataDir]
+Cabinet-cli.exe --saves-plan <appid> <archive.zip> [dataDir]   # dry-run restore: destinations + backup file
+Cabinet-cli.exe --saves-selftest                               # temp folders + in-memory server
+Cabinet-cli.exe --cloud-selftest                               # temp folders + localhost fake server
+```
+
+The client always writes `cabinet-save.json` stored (its own deterministic ZIP writer: fixed
+times, sorted entries, CRC-32, raw Deflate for files); the server also accepts a deflated manifest.
 
 ## Deploy order
 
