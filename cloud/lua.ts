@@ -48,30 +48,36 @@ function entryPath(name: string): string {
 }
 const isDoc = (name: string) => /\.(txt|md)$/i.test(name);
 
-const PIN = /setManifestid\s*\(\s*(\d{1,10})\s*,\s*"(\d{1,20})"/i;
-const STATEMENT = /^(addappid|setManifestid|addtoken)\s*\(/i;
-const ADDAPPID = /^addappid\s*\(\s*(\d{1,10})\s*[,)]/i;
+// ManifestContentPolicy's declaration grammar: double or single quotes, an optional size, an optional
+// ';' and an optional trailing "-- comment", which is ignored.
+const PIN = /^setManifestid[ \t]*\([ \t]*([1-9][0-9]{0,9})[ \t]*,[ \t]*(?:"([0-9]{1,20})"|'([0-9]{1,20})')[ \t]*(?:,[ \t]*[0-9]{1,20}[ \t]*)?\)[ \t]*;?[ \t]*(?:--.*)?$/i;
+const STATEMENT = /^(addappid|setManifestid|addtoken)[ \t]*\(/i;
+const ADDAPPID = /^addappid[ \t]*\([ \t]*([1-9][0-9]{0,9})[ \t]*[,)]/i;
 /**
- * Depot → manifest pins from `setManifestid(depot, "manifest")`, as LuaTools' LuaFileParser reads them:
- * active lines win over commented ones ("Auto Update Apps" comments pins out). The lua must declare
- * the app it is stored under, actively or commented, as ManifestContentPolicy requires.
+ * Depot → manifest pins of the lua's ACTIVE, full-line `setManifestid` declarations, read exactly as
+ * LuaTools' cache check reads them. Commented-out lines and trailing comments never count, so a pin
+ * hidden in a comment cannot vouch for a different active pin. Refused: a depot pinned more than once,
+ * and a lua without an active `addappid(<appid>)` (stricter than LuaTools' install policy, because a
+ * shared copy comes from another user).
  */
 export function luaPins(text: string, appid: string): Record<string, string> {
-  const active: Record<string, string> = {}, commented: Record<string, string> = {};
+  const pins: Record<string, string> = {};
   let declared = false;
   for (const raw of text.replace(/^﻿/, "").split(/\r\n|\r|\n/)) {
     const line = raw.trim();
     if (line.includes("[[") || /\[=+\[/.test(line)) invalid("Lua block strings and comments are not allowed.");
-    if (!line) continue;
-    const comment = line.startsWith("--"), body = comment ? line.slice(2).trimStart() : line;
-    if (!comment && !STATEMENT.test(line)) invalid("Lua may contain only addappid, addtoken and setManifestid declarations.");
-    const pin = PIN.exec(line);
-    if (pin) (comment ? commented : active)[String(Number(pin[1]))] = pin[2]!;
-    const app = ADDAPPID.exec(body);
+    if (!line || line.startsWith("--")) continue;
+    if (!STATEMENT.test(line)) invalid("Lua may contain only addappid, addtoken and setManifestid declarations.");
+    const app = ADDAPPID.exec(line);
     if (app && Number(app[1]) === Number(appid)) declared = true;
+    if (!/^setManifestid/i.test(line)) continue;
+    const pin = PIN.exec(line);
+    if (!pin) invalid("Invalid setManifestid declaration.");
+    const depot = pin[1]!;
+    if (depot in pins) invalid("A depot is pinned more than once.");
+    pins[depot] = pin[2] ?? pin[3]!;
   }
-  if (!declared) invalid("Lua does not declare this app.");
-  const pins = { ...commented, ...active };
+  if (!declared) invalid("Lua does not actively declare this app.");
   return Object.fromEntries(Object.keys(pins).sort((a, b) => Number(a) - Number(b)).map(depot => [depot, pins[depot]!]));
 }
 

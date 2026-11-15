@@ -112,14 +112,28 @@ test("a newer package replaces the current one; the newest three are kept", asyn
   expect((await call("/api/apps/440/lua?sha256=nope")).status).toBe(400);
 });
 
-test("pins follow LuaTools: active pins win over commented ones", () => {
-  const text = "\uFEFFaddappid(10)\r\n-- setManifestid(11, \"1\")\r\nsetManifestid(11, \"2\", 99)\r\n-- setManifestid(12, \"3\")\r\naddtoken(10, \"5\")\r\n\r\n-- a comment\r\n";
-  expect(luaPins(text, "10")).toEqual({ "11": "2", "12": "3" });
-  // A commented declaration of the app counts, as in ManifestContentPolicy.
-  expect(luaPins("-- addappid(10)\n", "10")).toEqual({});
-  expect(() => luaPins("addappid(11)\n", "10")).toThrow("does not declare");
+test("pins come only from active, full-line declarations in the install policy's grammar", () => {
+  const text = "\uFEFFaddappid(10) -- Game\r\n-- setManifestid(11, \"1\")\r\nsetManifestid(11, '2', 99); -- note\r\n-- setManifestid(12, \"3\")\r\nsetManifestid(13, \"4\")\r\naddtoken(10, \"5\")\r\n\r\n-- a comment\r\n";
+  expect(luaPins(text, "10")).toEqual({ "11": "2", "13": "4" });
+  expect(luaPins("addappid(10)\n", "10")).toEqual({});
+  expect(() => luaPins("addappid(11)\n", "10")).toThrow("does not actively declare");
   expect(() => luaPins("addappid(10)\nos.execute('x')\n", "10")).toThrow();
   expect(() => luaPins("addappid(10)\n--[[ x\n", "10")).toThrow();
+  expect(() => luaPins("addappid(10)\nsetManifestid(11, \"2\") os.exit()\n", "10")).toThrow("Invalid setManifestid");
+});
+
+test("a pin hidden in a comment cannot vouch for a different active pin", () => {
+  // Single-quoted stale pin with a "current" double-quoted pin in its trailing comment.
+  expect(luaPins("addappid(10)\nsetManifestid(481,'1111') -- setManifestid(481,\"2222\")\n", "10")).toEqual({ "481": "1111" });
+  // Stale pin followed by a commented-out "current" one.
+  expect(luaPins("addappid(10)\nsetManifestid(481, '1111')\n-- setManifestid(481, \"2222\")\n", "10")).toEqual({ "481": "1111" });
+});
+
+test("ambiguous or undeclared luas are refused", () => {
+  expect(() => luaPins("addappid(10)\nsetManifestid(11, \"1\")\nsetManifestid(11, \"2\")\n", "10")).toThrow("more than once");
+  expect(() => luaPins("addappid(10)\nsetManifestid(11, \"1\")\nsetManifestid(11, '1')\n", "10")).toThrow("more than once");
+  // Only commented out: LuaTools' install policy would accept it, a shared copy may not.
+  expect(() => luaPins("-- addappid(10)\naddappid(11, 1, \"aa\")\n", "10")).toThrow("does not actively declare");
 });
 
 test("malformed packages and parameters are refused", async () => {
@@ -144,6 +158,8 @@ test("malformed packages and parameters are refused", async () => {
     ["bomb", zipOf([{ name: "70.lua", data: lua("70", "1") }, { name: "71_2.manifest", data: new Uint8Array(4 * 1024 * 1024), deflate: true }])],
     ["latin-1 lua", zipOf([{ name: "70.lua", data: new Uint8Array([...new TextEncoder().encode(lua("70", "1")), 0x2d, 0x2d, 0xe9]) }])],
     ["EOCD count", zipOf([{ name: "70.lua", data: lua("70", "1") }], { eocdCount: 2 })],
+    ["pinned twice", zipOf([{ name: "70.lua", data: lua("70", "1", "setManifestid(71, \"2\")") }])],
+    ["app only commented", zipOf([{ name: "70.lua", data: `-- addappid(70)\naddappid(71, 1, "${"ab".repeat(32)}")\n` }])],
   ];
   for (const [why, zip] of bad) {
     const response = await put("70", zip);
