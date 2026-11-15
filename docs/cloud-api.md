@@ -183,8 +183,10 @@ LuaMeta = { appid, sha256, size, pins: { "<depotId>": "<manifestId>" }, source, 
 - `uploader` is the uploading user's display name. Their user id and device stay private (the device
   is stored for the admin's benefit only).
 - `pins` are read by the server from the package's lua, never taken from the request, so meta always
-  describes the bytes: every `setManifestid(<depot>, "<manifest>")`, with an active line winning over
-  a commented one (LuaTools' "Auto Update Apps" comments pins out), sorted by depot.
+  describes the bytes: every ACTIVE, full-line `setManifestid(<depot>, "<manifest>"[, size])` (double
+  or single quotes, as LuaTools' install policy allows), sorted by depot. Commented-out lines and
+  trailing `-- …` comments never count, so a pin hidden in a comment cannot vouch for a different
+  active pin. LuaTools reads the package with the same rule.
 - `source` is the source the uploader downloaded from (1–64 characters, no control characters).
   `deviceId` follows the save rules; the stored device name comes from that user's progress pushes.
 - The same SHA-256 as the current copy is a no-op: `200` with the current `LuaMeta` (nothing changes,
@@ -196,7 +198,8 @@ LuaMeta = { appid, sha256, size, pins: { "<depotId>": "<manifestId>" }, source, 
   1–4096 entries, safe relative paths (no `..`, absolute or drive paths, reserved Windows names,
   duplicates), no entry expanding beyond max(1 MiB, 200 × its compressed size), 256 MiB expanded
   in total; files are exactly one `.lua` (max 2 MiB, UTF-8, only `addappid`/`addtoken`/
-  `setManifestid` lines and comments, no block strings, declaring `addappid(<appid>…)`),
+  `setManifestid` lines and comments, no block strings, an ACTIVE `addappid(<appid>…)` (a commented
+  one is not enough here, stricter than LuaTools' install policy), no depot pinned more than once),
   `<depot>_<manifest>.manifest` files (max 64 MiB each) and `.txt`/`.md` documentation (max 256 KiB).
   These mirror LuaTools' `ManifestContentPolicy`; the client still validates every package again
   before installing, since a cached copy comes from another user.
@@ -205,11 +208,18 @@ LuaMeta = { appid, sha256, size, pins: { "<depotId>": "<manifestId>" }, source, 
   client's own expanded ceiling (256 MiB) can only be approached by packages no source serves.
 - Writes need `Origin: https://cabinet.<domain>` like every other write.
 
-Client rules (LuaTools): only when connected to Cabinet; it checks `meta` first and uses the copy only
-if every pinned depot that Steam reports a public manifest for matches it (if Steam's depot info
-cannot be fetched, the copy is not used). It installs through the same validation as any other
-source and never re-uploads a copy it got from the cache. Uploads are automatic, in the background,
-and failures are only logged. Packages fetched with a user's personal Hubcap key are never uploaded.
+Client rules (LuaTools): only when connected to Cabinet. A package is **current** when every active pin
+and every `<depot>_<manifest>.manifest` file it carries names the manifest Steam ships now, for each
+depot Steam reports a public manifest for (a lua without pins follows Steam's latest build, so it is
+current unless a manifest file it carries is stale); without Steam's depot info nothing is current.
+- Lookup: `meta` first (3 s timeout), then the bytes (a deadline of 10 s plus 1 s per 256 KiB,
+  at most 120 s). The copy is used only if its SHA-256 matches `meta` and the package itself is
+  current; it is installed through the same validation as any other source. A server failure or
+  timeout makes the client skip the cache for 5 minutes.
+- Upload: automatic, in the background, after a successful install from a normal source, only when
+  that package is current (so an older build never replaces a newer copy). Never for a copy that
+  came from the cache, nor for sources fetched with the user's own key (Hubcap, or any source the
+  catalogue marks as needing a key). Failures are only logged.
 
 ## Pairing codes
 
