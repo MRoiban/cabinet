@@ -1,5 +1,6 @@
 import { definePebble } from "bedrock";
-import { users, tokens, apps, devices, saves, presence, cloudFiles, pairingCodes, appNames, saveArchives, appActivity, achievementSchemas, luaCache } from "./schema";
+import { users, tokens, apps, devices, saves, presence, cloudFiles, pairingCodes, appNames, saveArchives, appActivity, achievementSchemas, luaCache,
+  hubcapKeys, hubcapJobs, hubcapRequesters } from "./schema";
 import { saveZips, cloudBlobs, archiveZips, luaZips } from "./storage";
 import { apiRoutes } from "./api";
 import { archiveRoutes } from "./archive";
@@ -9,12 +10,15 @@ import { nameJobs, nameRoutes } from "./names";
 import { adminMutations, adminQueries } from "./admin";
 import { achievementRoutes } from "./achievements";
 import { luaRoutes } from "./lua";
+import { hubcapMutations, hubcapQueries, hubcapRoutes, hubcapServices } from "./hubcap";
 
 // The web app serves every other path, including /admin and /connect#<token>.
 export default definePebble({
   name: "cabinet", access: "public", web: "./web/index.html",
-  schema: { users, tokens, apps, devices, saves, presence, cloudFiles, pairingCodes, appNames, saveArchives, appActivity, achievementSchemas, luaCache },
+  schema: { users, tokens, apps, devices, saves, presence, cloudFiles, pairingCodes, appNames, saveArchives, appActivity, achievementSchemas, luaCache,
+    hubcapKeys, hubcapJobs, hubcapRequesters },
   storage: [saveZips, cloudBlobs, archiveZips, luaZips],
-  queries: adminQueries, mutations: adminMutations, jobs: nameJobs,
-  routes: { ...apiRoutes, ...archiveRoutes, ...cloudRoutes, ...pairingRoutes, ...nameRoutes, ...achievementRoutes, ...luaRoutes },
+  queries: { ...adminQueries, ...hubcapQueries }, mutations: { ...adminMutations, ...hubcapMutations }, jobs: nameJobs,
+  services: hubcapServices,
+  routes: { ...apiRoutes, ...archiveRoutes, ...cloudRoutes, ...pairingRoutes, ...nameRoutes, ...achievementRoutes, ...luaRoutes, ...hubcapRoutes },
 });
