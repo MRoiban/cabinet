@@ -24,10 +24,38 @@ export interface LuaMeta {
   appid: string; sha256: string; size: number; pins: Record<string, string>;
   source: string; uploadedAt: number; uploader: string;
 }
-function luaMeta(ctx: FunctionContext, row: Row): LuaMeta {
+/** The uploader shown for packages the server fetched itself (the Hubcap relay), which no user uploaded. */
+export const SERVER_UPLOADER = "Cabinet Cloud";
+export function luaMeta(ctx: FunctionContext, row: Row): LuaMeta {
   const { appid, sha256, size, pins, source, uploadedAt } = row;
-  const uploader = ctx.db.select().from(users).where(eq(users.id, row.userId)).get()?.name ?? "";
+  const uploader = row.userId === null ? SERVER_UPLOADER
+    : ctx.db.select().from(users).where(eq(users.id, row.userId)).get()?.name ?? "";
   return { appid, sha256, size, pins, source, uploadedAt, uploader };
+}
+
+/** Who stored a version: a user's upload (their device), or the server itself (userId null). */
+export interface LuaUploader { userId: string | null; deviceId: string; deviceName: string }
+/**
+ * Makes a package validated by {@link inspectLua} the app's current version, keeping the newest
+ * {@link KEEP_LUA_VERSIONS}. The same package as the current one changes nothing (`stored` false).
+ * Runs inside a write slot; old blobs are deleted after the commit.
+ */
+export async function storeLua(slot: FunctionContext, appid: string, body: Uint8Array, sha256: string,
+  pins: Record<string, string>, source: string, uploader: LuaUploader): Promise<{ meta: LuaMeta; stored: boolean }> {
+  const all = luaVersions(slot, appid), current = all[0];
+  if (current && current.sha256 === sha256) return { meta: luaMeta(slot, current), stored: false };
+  return withInternalStorage(slot, async () => {
+    const file = await slot.storage.put(luaZips, new Blob([body as Uint8Array<ArrayBuffer>]), { name: `${appid}.zip`, mime: "application/zip" });
+    const values = { id: crypto.randomUUID(), appid, fileId: file.id, sha256, size: body.length, pins, source,
+      uploadedAt: Math.max(Date.now(), (current?.uploadedAt ?? 0) + 1), ...uploader };
+    slot.db.insert(luaCache).values(values).run();
+    // Retention: the newest KEEP_LUA_VERSIONS stay; blob deletion runs after the commit.
+    for (const old of all.slice(KEEP_LUA_VERSIONS - 1)) {
+      slot.db.delete(luaCache).where(eq(luaCache.id, old.id)).run();
+      await slot.storage.delete(luaZips, old.fileId);
+    }
+    return { meta: luaMeta(slot, values), stored: true };
+  });
 }
 export function luaVersions(ctx: FunctionContext, appid: string): Row[] {
   // uploadedAt is strictly increasing per app (see PUT), so it orders versions.
@@ -126,25 +154,11 @@ export const luaRoutes: Record<string, DetachedRouteDefinition> = {
     const body = await limitedBody(request, MAX_LUA_ARCHIVE, "Lua package exceeds 90 MiB.");
     if (new Bun.CryptoHasher("sha256").update(body).digest("hex") !== sha256) invalid("SHA-256 does not match the upload.");
     const { pins } = inspectLua(body, appid);
-    const meta = await ctx.write(async slot => {
+    const { meta } = await ctx.write(async slot => {
       const user = authenticate(slot);
-      const all = luaVersions(slot, appid), current = all[0];
       // The same package again (another user installing the cached copy's source) changes nothing.
-      if (current && current.sha256 === sha256) return luaMeta(slot, current);
       const device = slot.db.select().from(devices).where(and(eq(devices.userId, user.id), eq(devices.deviceId, deviceId))).get();
-      return withInternalStorage(slot, async () => {
-        const file = await slot.storage.put(luaZips, new Blob([body]), { name: `${appid}.zip`, mime: "application/zip" });
-        const values = { id: crypto.randomUUID(), appid, fileId: file.id, sha256, size: body.length, pins, source,
-          uploadedAt: Math.max(Date.now(), (current?.uploadedAt ?? 0) + 1), userId: user.id, deviceId,
-          deviceName: device?.name ?? deviceId };
-        slot.db.insert(luaCache).values(values).run();
-        // Retention: the newest KEEP_LUA_VERSIONS stay; blob deletion runs after the commit.
-        for (const old of all.slice(KEEP_LUA_VERSIONS - 1)) {
-          slot.db.delete(luaCache).where(eq(luaCache.id, old.id)).run();
-          await slot.storage.delete(luaZips, old.fileId);
-        }
-        return luaMeta(slot, values);
-      });
+      return storeLua(slot, appid, body, sha256, pins, source, { userId: user.id, deviceId, deviceName: device?.name ?? deviceId });
     });
     return json(meta);
   }),
