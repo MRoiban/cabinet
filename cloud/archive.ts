@@ -104,8 +104,8 @@ export function inspectArchive(bytes: Uint8Array, appid: string): ArchiveManifes
   return { contentHash, files: manifest.files.length, bytes: bytesTotal };
 }
 
-async function limitedBody(request: Request): Promise<Uint8Array<ArrayBuffer>> {
-  if (Number(request.headers.get("content-length")) > MAX_SAVE) invalid("Save exceeds 90 MiB.");
+export async function limitedBody(request: Request, limit = MAX_SAVE, tooLarge = "Save exceeds 90 MiB."): Promise<Uint8Array<ArrayBuffer>> {
+  if (Number(request.headers.get("content-length")) > limit) invalid(tooLarge);
   const reader = request.body?.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -113,12 +113,12 @@ async function limitedBody(request: Request): Promise<Uint8Array<ArrayBuffer>> {
     const { done, value } = await reader.read();
     if (done) break;
     size += value.length;
-    if (size > MAX_SAVE) { await reader.cancel(); invalid("Save exceeds 90 MiB."); }
+    if (size > limit) { await reader.cancel(); invalid(tooLarge); }
     chunks.push(value);
   }
   return Buffer.concat(chunks) as Uint8Array<ArrayBuffer>;
 }
-const hex64 = (value: string | null, what: string, optional = false) => {
+export const hex64 = (value: string | null, what: string, optional = false) => {
   const v = value ?? "";
   if (optional && v === "") return "";
   if (!/^[a-fA-F0-9]{64}$/.test(v)) invalid(`Invalid ${what}.`);
@@ -128,9 +128,10 @@ const integer = (value: string | null, what: string) => {
   if (!/^\d{1,15}$/.test(value ?? "")) invalid(`Invalid ${what}.`);
   return Number(value);
 };
-const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
+export const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
 
-function route(handler: (request: Request, ctx: DetachedContext) => Promise<Response>): DetachedRouteDefinition {
+/** A detached, bearer-authenticated route with the usual `{ error }` envelope for 400/401. */
+export function route(handler: (request: Request, ctx: DetachedContext) => Promise<Response>): DetachedRouteDefinition {
   return detached(async (request, _server, ctx) => {
     try {
       const response = await handler(request, ctx);

@@ -6,7 +6,10 @@ const internal = new WeakSet<FunctionContext>();
 export const saveZips = bucket("saves", { maxSize: MAX_SAVE, accept: ["application/zip"], access: ctx => internal.has(ctx) });
 // Format-2 archives get their own internal bucket so legacy and versioned saves stay distinguishable.
 export const archiveZips = bucket("archives", { maxSize: MAX_SAVE, accept: ["application/zip"], access: ctx => internal.has(ctx) });
-export const cloudBlobs = bucket("cloud", { maxSize: MAX_CLOUD_FILE, access: ctx => internal.has(ctx) });
+// Shared Lua config packages (lua.ts), internal like the save buckets.
+export const MAX_LUA_ARCHIVE = 90 * 1024 * 1024;
+export const luaZips = bucket("lua", { maxSize: MAX_LUA_ARCHIVE, accept: ["application/zip"], access: ctx => internal.has(ctx) });
+export const cloudBlobs =bucket("cloud", { maxSize: MAX_CLOUD_FILE, access: ctx => internal.has(ctx) });
 export async function withInternalStorage<T>(ctx: FunctionContext, action: () => Promise<T>): Promise<T> {
   internal.add(ctx);
   const identity = ctx.user;

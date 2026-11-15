@@ -194,3 +194,16 @@ client uploaded such ZIPs for empty OnlineFix `Saves` folders. See
 the deploy order. `bun test` covers uploads, history, idempotent retries, 409s,
 tombstones, retention with blob deletion, malformed archives and paths, user
 isolation and the legacy refusal.
+
+## Lua config cache
+
+`/api/apps/:appid/lua` (`lua.ts`) keeps LuaTools' game configs (a manifest package: one `.lua`,
+Steam `.manifest` files, small docs) **shared by every user of the server**, in table `lua_cache`
+(migration `20261115141108_lua_cache`) and the internal `lua` bucket, which generic Bedrock file
+endpoints cannot reach. The server checks the ZIP against the limits of LuaTools'
+`ManifestContentPolicy` without extracting it, reads only the lua (to check that it declares the app
+and to derive the depot→manifest pins shown in meta) and keeps the newest 3 versions per app. The
+same package again is a no-op. Meta shows only the uploader's display name. The routes are detached
+like the archive routes. See [the client contract](../docs/cloud-api.md#lua-config-cache-luatools).
+`bun test` covers sharing across users, the no-op, replacement and retention with blob deletion,
+pin parsing and malformed packages.
