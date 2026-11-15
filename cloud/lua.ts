@@ -110,10 +110,10 @@ export function luaPins(text: string, appid: string): Record<string, string> {
 }
 
 /** Validates a manifest package (one .lua, Steam .manifest files, small .txt/.md docs) and reads its pins. */
-export function inspectLua(bytes: Uint8Array, appid: string): { pins: Record<string, string> } {
+export function inspectLua(bytes: Uint8Array, appid: string): { pins: Record<string, string>; manifests: string[] } {
   const entries = centralDirectory(bytes);
   if (!entries.length || entries.length > MAX_ENTRIES) invalid("Archive entry count exceeds its limit.");
-  const names = new Set<string>(), targets = new Set<string>();
+  const names = new Set<string>(), targets = new Set<string>(), manifests: string[] = [];
   let total = 0, lua: CentralEntry | null = null;
   for (const entry of entries) {
     if (entry.flags & 0x1) invalid("Encrypted ZIP entries are not supported.");
@@ -134,13 +134,22 @@ export function inspectLua(bytes: Uint8Array, appid: string): { pins: Record<str
       lua = entry;
     } else if (/\.manifest$/i.test(file)) {
       if (!MANIFEST_FILE.test(file) || entry.size > MAX_MANIFEST) invalid("Invalid Steam manifest entry.");
+      manifests.push(file.toLowerCase());
     } else invalid("A package may contain only Lua data, Steam manifests and plain text documentation.");
   }
   if (!lua) invalid("The package contains no Lua file.");
   let text: string;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(readEntry(bytes, lua, MAX_LUA)); }
   catch (error) { if (error instanceof TypeError) invalid("Lua is not UTF-8."); throw error; }
-  return { pins: luaPins(text, appid) };
+  return { pins: luaPins(text, appid), manifests: manifests.sort() };
+}
+
+/**
+ * The build a validated package describes: its active pins plus the `<depot>_<manifest>.manifest` files
+ * it carries. Two packages with the same build differ only in ways a client's freshness check ignores.
+ */
+export function sameBuild(a: { pins: Record<string, string>; manifests: string[] }, b: { pins: Record<string, string>; manifests: string[] }): boolean {
+  return JSON.stringify(a.pins) === JSON.stringify(b.pins) && JSON.stringify(a.manifests) === JSON.stringify(b.manifests);
 }
 
 export const luaRoutes: Record<string, DetachedRouteDefinition> = {

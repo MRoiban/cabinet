@@ -1,6 +1,8 @@
 CREATE TABLE `hubcap_keys` (
 	`id` text PRIMARY KEY NOT NULL,
-	`key` text NOT NULL,
+	`sealed` text NOT NULL,
+	`digest` text NOT NULL,
+	`hint` text NOT NULL,
 	`label` text,
 	`added_at` integer NOT NULL,
 	`daily_usage` integer,
@@ -14,6 +16,7 @@ CREATE TABLE `hubcap_keys` (
 	`last_error_at` integer,
 	`last_used_at` integer
 );
+CREATE UNIQUE INDEX `hubcap_keys_digest_unique` ON `hubcap_keys` (`digest`);
 CREATE TABLE `hubcap_jobs` (
 	`id` text PRIMARY KEY NOT NULL,
 	`appid` text NOT NULL,

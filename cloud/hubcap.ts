@@ -3,9 +3,10 @@ import { and, asc, desc, eq, inArray, isNotNull, lt, mutation, query, service, B
 import { authenticate, creator } from "./auth";
 import { hubcapJobs, hubcapKeys, hubcapRequesters, users, type HubcapState } from "./schema";
 import { hex64, json, limitedBody, route } from "./archive";
-import { inspectLua, luaMeta, luaVersions, storeLua, SERVER_UPLOADER, type LuaMeta } from "./lua";
+import { inspectLua, luaMeta, luaVersions, sameBuild, storeLua, SERVER_UPLOADER, type LuaMeta } from "./lua";
+import { digestKey, openKey, sealKey, secretState, SecretNotSet } from "./hubcap-crypto";
 import { namesFor } from "./names";
-import { MAX_LUA_ARCHIVE } from "./storage";
+import { MAX_LUA_ARCHIVE, luaZips, withInternalStorage } from "./storage";
 import { appId, args, invalid, record } from "./validation";
 
 // Hubcap relay (docs/cloud-api.md, "Hubcap relay"). The server owner keeps a pool of Hubcap API keys
@@ -13,8 +14,9 @@ import { appId, args, invalid, record } from "./validation";
 // into the shared Lua cache (lua.ts). One worker runs the queue, one job at a time, FIFO.
 //
 // A key never leaves this module except toward Hubcap itself: no response, admin view, log line or
-// error carries it (admin views get a mask). Upstream failures are recorded as short codes only, never
-// as exception text, because a fetch error can quote the request URL and the manifest URL holds the key.
+// error carries it (admin views get a mask). Keys are encrypted at rest (hubcap-crypto.ts). Upstream
+// failures are recorded as short codes only, never as exception text, because a fetch error can quote
+// the request URL and the manifest URL holds the key.
 
 export const HUBCAP_ORIGIN = "https://hubcapmanifest.com";
 export const KEY_FORMAT = /^smm_[0-9a-f]{96}$/;
@@ -26,6 +28,8 @@ export const STATS_TTL = 5 * 60_000;
 export const REFETCH_WINDOW = 30 * 60_000;
 /** Finished jobs are kept this long (the GET status, the admin list), then pruned. */
 export const JOB_RETENTION = 24 * 60 * 60_000;
+/** How long a client request waits for a stats re-check of a pool that looks dead before answering. */
+export const REVIVE_WAIT = 2_000;
 const IDLE_POLL = 10_000;
 const PRUNE_EVERY = 10 * 60_000;
 const QUICK_TIMEOUT = 15_000;
@@ -40,6 +44,7 @@ export interface RelayStatus { state: HubcapState; position?: number; error?: Re
 export const upstream = { fetch: (url: string, init: RequestInit): Promise<Response> => fetch(url, init) };
 
 type KeyRow = typeof hubcapKeys.$inferSelect;
+type LiveKey = KeyRow & { key: string };
 type JobRow = typeof hubcapJobs.$inferSelect;
 type IO = Pick<DetachedContext, "read" | "write">;
 
@@ -50,20 +55,23 @@ const expired = (row: KeyRow, now: number) => !!row.expiresAt && Date.parse(row.
 export function usable(row: KeyRow, now = Date.now()): boolean {
   return !row.disabled && !row.exhausted && row.canMakeRequests !== 0 && !expired(row, now);
 }
+/** The relay can fetch: the key secret is set and at least one key is usable. */
+export const relayEnabled = (rows: readonly KeyRow[], now = Date.now()) => secretState() === "ok" && rows.some(row => usable(row, now));
 const remaining = (row: KeyRow) => row.statsAt && row.dailyLimit !== null ? row.dailyLimit - (row.dailyUsage ?? 0) : Number.MAX_SAFE_INTEGER;
 /** The usable key with the most remaining daily quota (least recently used on a tie). */
-export function pickKey(rows: readonly KeyRow[], now = Date.now()): KeyRow | null {
+export function pickKey<T extends KeyRow>(rows: readonly T[], now = Date.now()): T | null {
   return [...rows].filter(row => usable(row, now))
     .sort((a, b) => remaining(b) - remaining(a) || (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0) || a.addedAt - b.addedAt)[0] ?? null;
 }
 /** Why no key is usable: out of quota beats an expired key beats a rejected one. */
 export function poolFailure(rows: readonly KeyRow[], now = Date.now()): RelayError {
-  if (!rows.length) return "relay_disabled";
-  if (rows.some(row => !row.disabled && !expired(row, now) && (row.exhausted || row.canMakeRequests === 0))) return "quota_exhausted";
-  if (rows.some(row => row.disabled === "expired" || expired(row, now))) return "key_expired";
+  const readable = rows.filter(row => row.disabled !== "unreadable");
+  if (secretState() !== "ok" || !readable.length) return "relay_disabled";
+  if (readable.some(row => !row.disabled && !expired(row, now) && (row.exhausted || row.canMakeRequests === 0))) return "quota_exhausted";
+  if (readable.some(row => row.disabled === "expired" || expired(row, now))) return "key_expired";
   return "key_rejected";
 }
-export function maskKey(key: string): string { return `smm_…${key.slice(-4)}`; }
+export const maskKey = (hint: string) => `smm_…${hint}`;
 
 type Stats = { dailyUsage: number; dailyLimit: number; canMakeRequests: boolean; expiresAt: string | null };
 type StatsResult = { kind: "ok"; stats: Stats } | { kind: "rejected" } | { kind: "unavailable" };
@@ -89,35 +97,44 @@ export async function fetchStats(key: string, signal?: AbortSignal): Promise<Sta
   } catch { return { kind: "unavailable" }; }
 }
 
-/** GET /api/v1/status/{appid} (free): whether Hubcap has a manifest for the app. */
-export async function fetchStatus(key: string, appid: string, signal?: AbortSignal): Promise<"exists" | "missing" | "rejected" | "unavailable"> {
+/**
+ * GET /api/v1/status/{appid} (free): whether Hubcap has a manifest for the app. A 401 rejects the key; a
+ * 403 is only `forbidden` (a blanket block such as a challenge page looks the same), confirmed by stats.
+ */
+export async function fetchStatus(key: string, appid: string, signal?: AbortSignal): Promise<"exists" | "missing" | "rejected" | "forbidden" | "quota" | "unavailable"> {
   try {
     const response = await upstream.fetch(`${HUBCAP_ORIGIN}/api/v1/status/${appid}`, {
       headers: { authorization: `Bearer ${key}` }, signal: timeout(QUICK_TIMEOUT, signal), redirect: "error" });
-    if (response.status === 401 || response.status === 403) { await response.body?.cancel(); return "rejected"; }
-    if (response.status === 404) { await response.body?.cancel(); return "missing"; }
-    if (!response.ok) { await response.body?.cancel(); return "unavailable"; }
+    const kind = response.status === 401 ? "rejected" : response.status === 403 ? "forbidden" : response.status === 429 ? "quota"
+      : response.status === 404 ? "missing" : !response.ok ? "unavailable" : null;
+    if (kind) { await response.body?.cancel(); return kind; }
     const exists = (await readJson(response))?.manifest_file_exists;
     return exists === true ? "exists" : exists === false ? "missing" : "unavailable";
   } catch { return "unavailable"; }
 }
 
-type DownloadResult = { kind: "ok"; bytes: Uint8Array } | { kind: "rejected" | "quota" | "missing" | "unavailable" | "too_large" };
-/** GET /api/v1/manifest/{appid} (counts against the key's daily limit). Content-Disposition is ignored. */
-export async function fetchManifest(key: string, appid: string, signal?: AbortSignal): Promise<DownloadResult> {
+type DownloadResult = { kind: "ok"; bytes: Uint8Array } | { kind: "rejected" | "forbidden" | "quota" | "missing" | "unavailable" | "broken" | "too_large" };
+/**
+ * GET /api/v1/manifest/{appid} (counts against the key's daily limit). `spent` runs as soon as a 200
+ * arrives, before the body is read: from then on the download counts even if the body fails (`broken`).
+ * Content-Disposition is ignored.
+ */
+export async function fetchManifest(key: string, appid: string, spent: () => Promise<void>, signal?: AbortSignal): Promise<DownloadResult> {
+  let response: Response;
   try {
-    const response = await upstream.fetch(`${HUBCAP_ORIGIN}/api/v1/manifest/${appid}?${keyQuery(key)}`, { signal: timeout(DOWNLOAD_TIMEOUT, signal), redirect: "error" });
-    const kind = response.status === 401 || response.status === 403 ? "rejected" : response.status === 429 ? "quota"
-      : response.status === 404 ? "missing" : !response.ok ? "unavailable" : null;
-    if (kind) { await response.body?.cancel(); return { kind }; }
-    try { return { kind: "ok", bytes: await limitedBody(response, MAX_LUA_ARCHIVE, "too large") }; }
-    catch (error) { if (error instanceof BedrockError) return { kind: "too_large" }; throw error; }
+    response = await upstream.fetch(`${HUBCAP_ORIGIN}/api/v1/manifest/${appid}?${keyQuery(key)}`, { signal: timeout(DOWNLOAD_TIMEOUT, signal), redirect: "error" });
   } catch { return { kind: "unavailable" }; }
+  const kind = response.status === 401 ? "rejected" : response.status === 403 ? "forbidden" : response.status === 429 ? "quota"
+    : response.status === 404 ? "missing" : !response.ok ? "unavailable" : null;
+  if (kind) { await response.body?.cancel().catch(() => {}); return { kind }; }
+  await spent();
+  try { return { kind: "ok", bytes: await limitedBody(response, MAX_LUA_ARCHIVE, "too large") }; }
+  catch (error) { return { kind: error instanceof BedrockError ? "too_large" : "broken" }; }
 }
 
 /** Records what a stats check said about a key, unless the key was replaced or removed meanwhile. */
 function applyStats(slot: FunctionContext, row: KeyRow, result: StatsResult) {
-  const now = Date.now(), same = and(eq(hubcapKeys.id, row.id), eq(hubcapKeys.key, row.key));
+  const now = Date.now(), same = and(eq(hubcapKeys.id, row.id), eq(hubcapKeys.sealed, row.sealed));
   if (result.kind === "ok") {
     const { dailyUsage, dailyLimit, canMakeRequests, expiresAt } = result.stats;
     const gone = !!expiresAt && Date.parse(expiresAt) <= now;
@@ -132,9 +149,29 @@ function applyStats(slot: FunctionContext, row: KeyRow, result: StatsResult) {
   }
 }
 function markKey(slot: FunctionContext, row: KeyRow, change: Partial<KeyRow>) {
-  slot.db.update(hubcapKeys).set(change).where(and(eq(hubcapKeys.id, row.id), eq(hubcapKeys.key, row.key))).run();
+  slot.db.update(hubcapKeys).set(change).where(and(eq(hubcapKeys.id, row.id), eq(hubcapKeys.sealed, row.sealed))).run();
 }
 const allKeys = (slot: FunctionContext) => slot.db.select().from(hubcapKeys).orderBy(asc(hubcapKeys.addedAt)).all();
+
+/**
+ * The pool with each key decrypted. A row the current secret cannot open is marked disabled
+ * ("unreadable", e.g. after the secret changed) and left out until a later check opens it again.
+ */
+async function liveKeys(io: IO): Promise<LiveKey[]> {
+  const rows = await io.read(allKeys), live: LiveKey[] = [];
+  for (const row of rows) {
+    const key = await openKey(row.sealed);
+    if (key) {
+      if (row.disabled === "unreadable") {
+        await io.write(slot => markKey(slot, row, { disabled: null, statsAt: 0 }));
+        live.push({ ...row, disabled: null, statsAt: 0, key });
+      } else live.push({ ...row, key });
+    } else if (row.disabled !== "unreadable" && secretState() === "ok") {
+      await io.write(slot => markKey(slot, row, { disabled: "unreadable", lastError: "key_unreadable", lastErrorAt: Date.now() }));
+    }
+  }
+  return live;
+}
 
 /**
  * Re-checks the stats of keys whose cached stats are older than {@link STATS_TTL} (or every key with
@@ -142,12 +179,40 @@ const allKeys = (slot: FunctionContext) => slot.db.select().from(hubcapKeys).ord
  */
 export async function refreshKeys(io: IO, options: { force?: boolean; ids?: string[]; signal?: AbortSignal | undefined } = {}): Promise<void> {
   const now = Date.now();
-  const due = (await io.read(allKeys)).filter(row => (options.ids ? options.ids.includes(row.id) : true)
+  const due = (await liveKeys(io)).filter(row => (options.ids ? options.ids.includes(row.id) : true)
     && (options.force || now - row.statsAt >= STATS_TTL));
   for (const row of due) {
     const result = await fetchStats(row.key, options.signal);
     await io.write(slot => applyStats(slot, row, result));
   }
+}
+
+/**
+ * A 403 from a status or manifest call may be a blanket block (a challenge page) rather than a dead key:
+ * ask that key's stats. Disabled only if stats also refuse it; true when the key was disabled.
+ */
+async function confirmForbidden(io: IO, key: LiveKey, signal?: AbortSignal): Promise<boolean> {
+  const result = await fetchStats(key.key, signal);
+  await io.write(slot => {
+    applyStats(slot, key, result);
+    if (result.kind !== "rejected") markKey(slot, key, { lastError: "hubcap_forbidden", lastErrorAt: Date.now() });
+  });
+  return result.kind === "rejected";
+}
+
+// Stats re-checks a client request asks for run on the worker, one at a time: requests share the same
+// in-flight check and wait at most REVIVE_WAIT for it, then answer from what is known.
+let revival: { promise: Promise<void>; resolve: () => void } | null = null;
+function requestRevival(): Promise<void> {
+  if (!revival) {
+    let resolve!: () => void;
+    revival = { promise: new Promise<void>(done => { resolve = done; }), resolve };
+    wake();
+  }
+  return revival.promise;
+}
+async function revive(): Promise<void> {
+  await Promise.race([requestRevival(), Bun.sleep(REVIVE_WAIT)]);
 }
 
 // ── Jobs ────────────────────────────────────────────────────────────────────
@@ -206,8 +271,9 @@ function enqueue(slot: FunctionContext, appid: string, stale: string | null): En
   const decision = decideWithoutFetch(slot, appid, stale, now);
   if (decision) return { status: decisionStatus(slot, appid, decision) };
   const keys = allKeys(slot);
-  if (!keys.some(row => usable(row, now)))
-    return { status: { state: "failed", error: poolFailure(keys, now) }, poolDue: keys.some(row => now - row.statsAt >= STATS_TTL) };
+  if (!relayEnabled(keys, now))
+    return { status: { state: "failed", error: poolFailure(keys, now) },
+      poolDue: secretState() === "ok" && keys.some(row => now - row.statsAt >= STATS_TTL) };
   const last = slot.db.select({ seq: hubcapJobs.seq }).from(hubcapJobs).orderBy(desc(hubcapJobs.seq)).limit(1).get();
   const job = { id: crypto.randomUUID(), appid, seq: (last?.seq ?? 0) + 1, state: "queued" as const, stale, createdAt: now };
   slot.db.insert(hubcapJobs).values(job).run();
@@ -221,67 +287,97 @@ function finish(slot: FunctionContext, jobId: string, decision: Decision) {
     .where(eq(hubcapJobs.id, jobId)).run();
 }
 
+/** The current cached version's bytes and build, read outside the write queue. */
+async function currentBuild(io: IO, appid: string) {
+  const current = await io.read(async slot => {
+    const row = luaVersions(slot, appid)[0];
+    if (!row) return null;
+    const bytes = await withInternalStorage(slot, async () => new Uint8Array(await (await slot.storage.get(luaZips, row.fileId)).arrayBuffer()));
+    return { sha256: row.sha256, bytes };
+  });
+  if (!current) return null;
+  try { return { sha256: current.sha256, build: inspectLua(current.bytes, appid) }; }
+  catch { return { sha256: current.sha256, build: null }; }
+}
+
 /** One job: rules first, then the free status check, then a download with key rotation, then storage. */
 export async function runJob(io: IO, job: JobRow, signal?: AbortSignal): Promise<void> {
   const done = (decision: Decision) => io.write(slot => finish(slot, job.id, decision));
   const early = await io.read(slot => decideWithoutFetch(slot, job.appid, job.stale, Date.now(), job.id));
   if (early) return done(early);
-
-  // 1. Free status check, with any key that isn't disabled (usable ones first).
-  let exists = false;
+  if (secretState() !== "ok") return done({ state: "failed", error: "relay_disabled" });
   await refreshKeys(io, { signal });
-  for (const row of (await io.read(allKeys)).filter(row => !row.disabled).sort((a, b) => Number(usable(b)) - Number(usable(a)))) {
-    const status = await fetchStatus(row.key, job.appid, signal);
-    if (signal?.aborted) return;
-    if (status === "rejected") { await io.write(slot => markKey(slot, row, { disabled: "rejected", lastError: "key_rejected", lastErrorAt: Date.now() })); continue; }
-    if (status === "unavailable") {
-      await io.write(slot => markKey(slot, row, { lastError: "hubcap_unavailable", lastErrorAt: Date.now() }));
-      return done({ state: "failed", error: "hubcap_unavailable" });
-    }
-    if (status === "missing") return done({ state: "failed", error: "no_manifest" });
-    exists = true;
-    break;
-  }
-  if (!exists) return done({ state: "failed", error: poolFailure(await io.read(allKeys)) });
 
-  // 2. Download with the usable key holding the most quota; rotate on 429 / rejection.
-  let bytes: Uint8Array | null = null;
-  for (let attempt = 0; !bytes; attempt++) {
-    await refreshKeys(io, { signal });
-    const rows = await io.read(allKeys), key = pickKey(rows);
-    if (!key || attempt > rows.length * 2) return done({ state: "failed", error: poolFailure(rows) });
-    const result = await fetchManifest(key.key, job.appid, signal);
+  // 1. Free status check: every key that isn't disabled may answer (usable ones first). A key that is
+  //    throttled, blocked or unreachable doesn't settle it; the job fails only after every key was tried.
+  let exists = false, transient = false;
+  const candidates = (await liveKeys(io)).filter(row => !row.disabled).sort((a, b) => Number(usable(b)) - Number(usable(a)));
+  for (const key of candidates) {
+    const status = await fetchStatus(key.key, job.appid, signal);
     if (signal?.aborted) return;
     const now = Date.now();
-    if (result.kind === "rejected") { await io.write(slot => markKey(slot, key, { disabled: "rejected", lastError: "key_rejected", lastErrorAt: now })); continue; }
-    if (result.kind === "quota") { await io.write(slot => markKey(slot, key, { exhausted: 1, lastError: "quota_exhausted", lastErrorAt: now })); continue; }
-    if (result.kind === "missing") return done({ state: "failed", error: "no_manifest" });
-    if (result.kind !== "ok") {
-      await io.write(slot => markKey(slot, key, { lastError: result.kind === "too_large" ? "invalid_package" : "hubcap_unavailable", lastErrorAt: now, lastUsedAt: now }));
-      // A body that arrived (even too large) was a spent download.
-      if (result.kind === "too_large") await io.write(slot => slot.db.update(hubcapJobs).set({ downloadedAt: now }).where(eq(hubcapJobs.id, job.id)).run());
-      return done({ state: "failed", error: result.kind === "too_large" ? "invalid_package" : "hubcap_unavailable" });
+    if (status === "missing") return done({ state: "failed", error: "no_manifest" });
+    if (status === "exists") { exists = true; break; }
+    if (status === "rejected") await io.write(slot => markKey(slot, key, { disabled: "rejected", lastError: "key_rejected", lastErrorAt: now }));
+    else if (status === "quota") await io.write(slot => markKey(slot, key, { exhausted: 1, lastError: "quota_exhausted", lastErrorAt: now }));
+    else if (status === "forbidden") { if (!await confirmForbidden(io, key, signal)) transient = true; }
+    else { transient = true; await io.write(slot => markKey(slot, key, { lastError: "hubcap_unavailable", lastErrorAt: now })); }
+  }
+  if (!exists) return done({ state: "failed", error: transient ? "hubcap_unavailable" : poolFailure(await io.read(allKeys)) });
+
+  // 2. Download with the usable key holding the most quota; rotate on 429, rejection, a block or an
+  //    outage before the download started. A key that failed transiently is not retried in this job.
+  let bytes: Uint8Array | null = null;
+  const skip = new Set<string>();
+  transient = false;
+  while (!bytes) {
+    await refreshKeys(io, { signal });
+    const live = await liveKeys(io), key = pickKey(live.filter(row => !skip.has(row.id)));
+    if (!key) return done({ state: "failed", error: transient ? "hubcap_unavailable" : poolFailure(await io.read(allKeys)) });
+    const result = await fetchManifest(key.key, job.appid, () => io.write(slot => {
+      markKey(slot, key, { lastUsedAt: Date.now() });
+      slot.db.update(hubcapJobs).set({ downloadedAt: Date.now() }).where(eq(hubcapJobs.id, job.id)).run();
+    }), signal);
+    if (signal?.aborted) return;
+    const now = Date.now();
+    switch (result.kind) {
+      case "ok": bytes = result.bytes; break;
+      case "rejected": await io.write(slot => markKey(slot, key, { disabled: "rejected", lastError: "key_rejected", lastErrorAt: now })); break;
+      case "quota": await io.write(slot => markKey(slot, key, { exhausted: 1, lastError: "quota_exhausted", lastErrorAt: now })); break;
+      case "forbidden": if (!await confirmForbidden(io, key, signal)) { skip.add(key.id); transient = true; } break;
+      case "unavailable":
+        skip.add(key.id); transient = true;
+        await io.write(slot => markKey(slot, key, { lastError: "hubcap_unavailable", lastErrorAt: now }));
+        break;
+      case "missing": return done({ state: "failed", error: "no_manifest" });
+      // After a 200 the download counted: don't spend another key's quota on it within the window.
+      case "broken":
+        await io.write(slot => markKey(slot, key, { lastError: "hubcap_unavailable", lastErrorAt: now }));
+        return done({ state: "failed", error: "hubcap_unavailable" });
+      case "too_large":
+        await io.write(slot => markKey(slot, key, { lastError: "invalid_package", lastErrorAt: now }));
+        return done({ state: "failed", error: "invalid_package" });
     }
-    bytes = result.bytes;
-    await io.write(slot => {
-      markKey(slot, key, { lastUsedAt: now });
-      slot.db.update(hubcapJobs).set({ downloadedAt: now }).where(eq(hubcapJobs.id, job.id)).run();
-    });
-    await refreshKeys(io, { ids: [key.id], force: true, signal });
+    if (bytes) await refreshKeys(io, { ids: [key.id], force: true, signal });
   }
 
-  // 3. The Lua cache's own upload validation, then the shared cache (or "Hubcap has nothing newer").
-  let pins: Record<string, string>;
-  try { pins = inspectLua(bytes, job.appid).pins; }
+  // 3. The Lua cache's own upload validation.
+  let fetched: ReturnType<typeof inspectLua>;
+  try { fetched = inspectLua(bytes, job.appid); }
   catch (error) {
     if (error instanceof BedrockError && error.code === "INVALID_ARGS") return done({ state: "failed", error: "invalid_package" });
     throw error;
   }
   const sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+  // 4. Hubcap still on the build the cache has (same pins and manifest files, other bytes): nothing newer,
+  //    and the current entry stays. Otherwise the package becomes the shared cache's current version.
+  const current = await currentBuild(io, job.appid);
+  if (current && (current.sha256 === sha256 || (current.build && sameBuild(current.build, fetched))))
+    return done({ state: "upstream_not_newer", sha256: current.sha256 });
   await io.write(async slot => {
-    const { stored } = await storeLua(slot, job.appid, bytes, sha256, pins, RELAY_SOURCE,
+    const { stored, meta } = await storeLua(slot, job.appid, bytes, sha256, fetched.pins, RELAY_SOURCE,
       { userId: null, deviceId: "server", deviceName: SERVER_UPLOADER });
-    finish(slot, job.id, { state: stored ? "ready" : "upstream_not_newer", sha256 });
+    finish(slot, job.id, { state: stored ? "ready" : "upstream_not_newer", sha256: meta.sha256 });
   });
 }
 
@@ -325,10 +421,17 @@ async function worker(ctx: ServiceContext) {
     try {
       if (Date.now() - pruned > PRUNE_EVERY) { await ctx.write(slot => prune(slot)); pruned = Date.now(); }
       woken = false; // a wake from here on is seen by the next sleep
+      const asked = revival;
+      if (asked) {
+        // Client requests found the pool dead: one shared re-check of the keys whose stats are due.
+        try { if (secretState() === "ok") await refreshKeys(ctx, { signal: ctx.signal }); }
+        finally { if (revival === asked) revival = null; asked.resolve(); }
+      }
       job = await ctx.write(claimNext);
       if (job) { await runJob(ctx, job, ctx.signal); continue; }
       // Keys added or replaced in the admin get their first stats check while the queue is empty.
-      if ((await ctx.read(allKeys)).some(row => row.statsAt === 0)) await refreshKeys(ctx, { signal: ctx.signal });
+      if (secretState() === "ok" && (await ctx.read(allKeys)).some(row => row.statsAt === 0 || row.disabled === "unreadable"))
+        await refreshKeys(ctx, { signal: ctx.signal });
     } catch (error) {
       // A code only: an exception could quote an upstream URL, and the manifest URL holds a key.
       ctx.log(`Hubcap relay: worker error (${error instanceof Error ? error.name : "unknown"})`);
@@ -356,26 +459,23 @@ export const hubcapServices = {
 
 // ── Client routes ───────────────────────────────────────────────────────────
 
-/** Re-checks a pool that looks dead, at most every STATS_TTL, before answering from it. */
-async function revive(io: IO) { await refreshKeys(io); }
-
 export const hubcapRoutes: Record<string, DetachedRouteDefinition> = {
   "GET /api/hubcap": route(async (_request, ctx) => {
     const first = await ctx.write(slot => {
       authenticate(slot);
       const keys = allKeys(slot), now = Date.now();
-      return { enabled: keys.some(row => usable(row, now)), due: keys.some(row => now - row.statsAt >= STATS_TTL) };
+      return { enabled: relayEnabled(keys, now), due: secretState() === "ok" && keys.some(row => now - row.statsAt >= STATS_TTL) };
     });
     if (first.enabled || !first.due) return json({ enabled: first.enabled });
-    await revive(ctx);
-    return json({ enabled: await ctx.read(slot => allKeys(slot).some(row => usable(row))) });
+    await revive();
+    return json({ enabled: await ctx.read(slot => relayEnabled(allKeys(slot))) });
   }),
   "POST /api/apps/:appid/hubcap": route(async (request, ctx) => {
     const url = new URL(request.url), appid = appId(url.pathname);
     const stale = hex64(url.searchParams.get("stale"), "stale SHA-256", true) || null;
     let result = await ctx.write(slot => enqueue(slot, appid, stale));
     if (result.poolDue) {
-      await revive(ctx);
+      await revive();
       result = await ctx.write(slot => enqueue(slot, appid, stale));
     }
     if (result.created) wake();
@@ -394,6 +494,7 @@ export const hubcapRoutes: Record<string, DetachedRouteDefinition> = {
   "POST /api/admin/hubcap/check": detached(async (_request, _server, ctx) => {
     const gate = await ctx.read(slot => !slot.user ? 401 : !creator(slot) ? 403 : 200);
     if (gate !== 200) return json({ error: gate === 401 ? "unauthorized" : "forbidden" }, gate);
+    if (secretState() !== "ok") return json({ error: "secret_not_set" }, 409);
     await refreshKeys(ctx, { force: true });
     return json({ ok: true });
   }),
@@ -405,9 +506,13 @@ function gate(ctx: FunctionContext) {
   if (!ctx.user) throw new BedrockError("UNAUTHENTICATED", "Sign in to manage Cabinet.", "Sign in with a Bedrock creator account.");
   if (!creator(ctx)) throw new BedrockError("FORBIDDEN", "This account can't manage Cabinet.", "Sign in with a Bedrock creator account.");
 }
+function requireSecret() {
+  if (secretState() !== "ok") throw new BedrockError("SECRET_NOT_SET", "The server secret HUBCAP_KEY_SECRET is not set, so keys can't be stored safely.",
+    "Set it with `bedrock secrets set cabinet HUBCAP_KEY_SECRET --restart` (see cloud/README.md).", undefined, { status: 409 });
+}
 function keyView(row: KeyRow, now = Date.now()) {
   return {
-    id: row.id, label: row.label, mask: maskKey(row.key), addedAt: row.addedAt,
+    id: row.id, label: row.label, mask: maskKey(row.hint), addedAt: row.addedAt,
     state: row.disabled ? "disabled" as const : usable(row, now) ? "usable" as const : "exhausted" as const,
     disabled: row.disabled, checkedAt: row.statsAt || null,
     stats: row.statsAt && row.dailyLimit !== null ? { dailyUsage: row.dailyUsage ?? 0, dailyLimit: row.dailyLimit,
@@ -430,9 +535,14 @@ function findKey(slot: FunctionContext, id: string): KeyRow {
   if (!row) throw new BedrockError("KEY_NOT_FOUND", "This key no longer exists.", "Reload the key list.");
   return row;
 }
-function refuseDuplicate(slot: FunctionContext, key: string, except?: string) {
-  const other = slot.db.select({ id: hubcapKeys.id }).from(hubcapKeys).where(eq(hubcapKeys.key, key)).get();
+function refuseDuplicate(slot: FunctionContext, digest: string, except?: string) {
+  const other = slot.db.select({ id: hubcapKeys.id }).from(hubcapKeys).where(eq(hubcapKeys.digest, digest)).get();
   if (other && other.id !== except) throw new BedrockError("KEY_CONFLICT", "This key is already in the pool.", "Each key can be added once.");
+}
+/** The stored form of a key: encrypted, its digest, and the 4 characters the admin may see. */
+async function seal(key: string) {
+  try { return { sealed: await sealKey(key), digest: await digestKey(key), hint: key.slice(-4) }; }
+  catch (error) { if (error instanceof SecretNotSet) requireSecret(); throw error; }
 }
 const FRESH_KEY = { dailyUsage: null, dailyLimit: null, canMakeRequests: null, expiresAt: null, statsAt: 0, exhausted: 0,
   disabled: null, lastError: null, lastErrorAt: null };
@@ -440,14 +550,14 @@ const FRESH_KEY = { dailyUsage: null, dailyLimit: null, canMakeRequests: null, e
 export const hubcapQueries = {
   adminHubcap: query(ctx => {
     gate(ctx);
-    const now = Date.now(), keys = allKeys(ctx);
+    const now = Date.now(), keys = allKeys(ctx), enabled = relayEnabled(keys, now);
     const jobs = ctx.db.select().from(hubcapJobs).orderBy(desc(hubcapJobs.seq)).limit(200).all();
     const requesters = jobs.length ? ctx.db.select({ jobId: hubcapRequesters.jobId, name: users.name, at: hubcapRequesters.requestedAt })
       .from(hubcapRequesters).innerJoin(users, eq(users.id, hubcapRequesters.userId))
       .where(inArray(hubcapRequesters.jobId, jobs.map(job => job.id))).orderBy(asc(hubcapRequesters.requestedAt)).all() : [];
     const names = namesFor(ctx, jobs.map(job => job.appid));
     return {
-      enabled: keys.some(row => usable(row, now)), failure: keys.some(row => usable(row, now)) ? null : poolFailure(keys, now),
+      secret: secretState(), enabled, failure: enabled ? null : poolFailure(keys, now),
       keys: keys.map(row => keyView(row, now)),
       jobs: jobs.map(job => ({ id: job.id, appid: job.appid, name: names[job.appid] ?? null,
         ...(({ state, position, error }) => ({ state, position: position ?? null, error: error ?? null }))(jobStatus(ctx, job)),
@@ -458,20 +568,27 @@ export const hubcapQueries = {
 };
 
 export const hubcapMutations = {
-  addHubcapKey: mutation(args(body => ({ key: keyArg(body.key), label: labelArg(body.label) })), (ctx, { key, label }) => {
-    gate(ctx); refuseDuplicate(ctx, key);
-    const row = { ...FRESH_KEY, id: crypto.randomUUID(), key, label, addedAt: Date.now(), lastUsedAt: null };
+  addHubcapKey: mutation(args(body => ({ key: keyArg(body.key), label: labelArg(body.label) })), async (ctx, { key, label }) => {
+    gate(ctx); requireSecret();
+    const stored = await seal(key);
+    refuseDuplicate(ctx, stored.digest);
+    const row = { ...FRESH_KEY, ...stored, id: crypto.randomUUID(), label, addedAt: Date.now(), lastUsedAt: null };
     ctx.db.insert(hubcapKeys).values(row).run();
     wake();
     return keyView(row);
   }),
   updateHubcapKey: mutation(args(body => ({ id: typeof body.id === "string" ? body.id : invalid("Invalid key id."),
     key: body.key === undefined || body.key === "" ? undefined : keyArg(body.key),
-    label: body.label === undefined ? undefined : labelArg(body.label) })), (ctx, { id, key, label }) => {
+    label: body.label === undefined ? undefined : labelArg(body.label) })), async (ctx, { id, key, label }) => {
     gate(ctx); findKey(ctx, id);
-    if (key !== undefined) refuseDuplicate(ctx, key, id);
-    ctx.db.update(hubcapKeys).set({ ...(key !== undefined ? { ...FRESH_KEY, key } : {}), ...(label !== undefined ? { label } : {}) })
-      .where(eq(hubcapKeys.id, id)).run();
+    let replacement = {};
+    if (key !== undefined) {
+      requireSecret();
+      const stored = await seal(key);
+      refuseDuplicate(ctx, stored.digest, id);
+      replacement = { ...FRESH_KEY, ...stored };
+    }
+    ctx.db.update(hubcapKeys).set({ ...replacement, ...(label !== undefined ? { label } : {}) }).where(eq(hubcapKeys.id, id)).run();
     if (key !== undefined) wake();
     return keyView(findKey(ctx, id));
   }),

@@ -9,12 +9,14 @@ import { JOB_RETENTION, REFETCH_WINDOW, STATS_TTL, prune, upstream } from "./hub
 import { sha, zipOf } from "./test-zip";
 
 // A fake Hubcap: every upstream request the relay makes lands here. The real Hubcap is never called.
-type FakeKey = { usage: number; limit: number; can?: boolean; expires?: string; reject?: boolean; throttle?: boolean };
+type FakeKey = { usage: number; limit: number; can?: boolean; expires?: string; reject?: boolean; throttle?: boolean;
+  statusCode?: number; downloadCode?: number; statsCode?: number; breakBody?: boolean; statsDelay?: number };
 const fake = {
   keys: new Map<string, FakeKey>(),
   manifests: new Map<string, Uint8Array<ArrayBuffer> | "missing">(),
   downloads: [] as { key: string; appid: string }[],
   statusCalls: 0,
+  statsCalls: 0,
   hold: null as Promise<void> | null,
 };
 const key = (c: string) => "smm_" + c.repeat(96);
@@ -25,8 +27,11 @@ async function fakeHubcap(url: string, init: RequestInit): Promise<Response> {
   const u = new URL(url);
   expect(u.origin).toBe("https://hubcapmanifest.com");
   if (u.pathname === "/api/v1/user/stats") {
+    fake.statsCalls++;
     const k = fake.keys.get(u.searchParams.get("api_key") ?? "");
+    if (k?.statsDelay) await Bun.sleep(k.statsDelay);
     if (!k || k.reject) return Response.json({ detail: "Invalid API key" }, { status: 401 });
+    if (k.statsCode) return new Response("stats failure", { status: k.statsCode });
     return Response.json({ user_id: "u", daily_usage: k.usage, daily_limit: k.limit, can_make_requests: k.can ?? k.usage < k.limit,
       ...(k.expires ? { api_key_expires_at: k.expires } : {}) });
   }
@@ -35,6 +40,7 @@ async function fakeHubcap(url: string, init: RequestInit): Promise<Response> {
     fake.statusCalls++;
     const k = fake.keys.get(new Headers(init.headers).get("authorization")?.replace(/^Bearer /, "") ?? "");
     if (!k || k.reject) return new Response("no", { status: 401 });
+    if (k.statusCode) return new Response("status failure", { status: k.statusCode });
     const m = fake.manifests.get(status[1]!);
     return Response.json({ status: "ok", manifest_file_exists: !!m && m !== "missing" });
   }
@@ -43,11 +49,16 @@ async function fakeHubcap(url: string, init: RequestInit): Promise<Response> {
     const apiKey = u.searchParams.get("api_key") ?? "", k = fake.keys.get(apiKey);
     if (!k || k.reject) return new Response("no", { status: 401 });
     if (k.throttle || k.usage >= k.limit) return new Response("limit", { status: 429 });
+    if (k.downloadCode) return new Response("blocked", { status: k.downloadCode });
     if (fake.hold) await fake.hold;
     const m = fake.manifests.get(manifest[1]!);
     if (!m || m === "missing") return new Response("none", { status: 404 });
     k.usage++;
     fake.downloads.push({ key: apiKey, appid: manifest[1]! });
+    if (k.breakBody) return new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(m.slice(0, 10));
+      controller.error(new Error("connection reset"));
+    } }), { headers: { "content-type": "application/zip" } });
     // The title in Content-Disposition is not a safe file name; the relay must ignore it.
     return new Response(m, { headers: { "content-type": "application/zip", "content-disposition": 'attachment; filename="Game: Sub/../x.zip"' } });
   }
@@ -56,7 +67,9 @@ async function fakeHubcap(url: string, init: RequestInit): Promise<Response> {
 
 let running: Awaited<ReturnType<typeof startPebble>>, temp: string, base: string, alex: string, sam: string;
 const previousSecret = process.env.BEDROCK_IDENTITY_SECRET, previousCreators = process.env.BEDROCK_CREATORS;
+const previousKeySecret = process.env.HUBCAP_KEY_SECRET;
 const secret = crypto.randomUUID();
+const keySecret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
 const transcript: string[] = []; // every response body and console line, checked for keys at the end
 const originalConsole = { log: console.log, warn: console.warn, error: console.error, info: console.info };
 const originalFetch = upstream.fetch;
@@ -126,6 +139,7 @@ beforeAll(async () => {
   temp = await mkdtemp(join(tmpdir(), "cabinet-hubcap-test-"));
   process.env.BEDROCK_IDENTITY_SECRET = secret;
   process.env.BEDROCK_CREATORS = '["owner@example.test"]';
+  process.env.HUBCAP_KEY_SECRET = keySecret;
   running = await startPebble({ dir: import.meta.dir, dataDir: temp, port: 0 });
   base = `http://127.0.0.1:${running.server.port}`;
   alex = await create("Alex");
@@ -138,8 +152,10 @@ afterAll(async () => {
   upstream.fetch = originalFetch;
   if (previousSecret === undefined) delete process.env.BEDROCK_IDENTITY_SECRET; else process.env.BEDROCK_IDENTITY_SECRET = previousSecret;
   if (previousCreators === undefined) delete process.env.BEDROCK_CREATORS; else process.env.BEDROCK_CREATORS = previousCreators;
+  if (previousKeySecret === undefined) delete process.env.HUBCAP_KEY_SECRET; else process.env.HUBCAP_KEY_SECRET = previousKeySecret;
 });
-beforeEach(() => { fake.downloads = []; fake.statusCalls = 0; fake.hold = null; });
+beforeEach(() => { fake.downloads = []; fake.statusCalls = 0; fake.statsCalls = 0; fake.hold = null; process.env.HUBCAP_KEY_SECRET = keySecret; });
+const keyRow = (k: string) => async () => (await admin("adminHubcap")).keys.find((row: { mask: string }) => row.mask.endsWith(k.slice(-4)));
 
 test("without keys the relay is off, and every route needs a Cabinet token", async () => {
   expect((await call("/api/hubcap", {}, null)).status).toBe(401);
@@ -362,6 +378,140 @@ test("expired and rejected pools fail with their own codes", async () => {
   expect((await ask("9600")).body).toEqual({ state: "failed", error: "key_rejected" });
 });
 
+test("Hubcap's package for the build the cache already has is not stored: nothing newer", async () => {
+  await pool([[K1, { usage: 0, limit: 10 }]]);
+  // A user shared build 1111 first.
+  const mine = pack("9800", "1111");
+  expect((await call(`/api/apps/9800/lua?sha256=${sha(mine)}&source=Ryuu&deviceId=pc`, { method: "PUT",
+    headers: { "content-type": "application/zip" }, body: mine })).status).toBe(200);
+  // Hubcap serves the same pins and manifest files in other bytes (an extra doc file).
+  const theirs = zipOf([{ name: "9800.lua", data: lua("9800", "1111"), deflate: true },
+    { name: "9801_1111.manifest", data: "manifest 1111" }, { name: "readme.txt", data: "from hubcap" }]);
+  fake.manifests.set("9800", theirs);
+  await ask("9800", sha(mine));
+  expect(await settle("9800")).toEqual({ state: "upstream_not_newer", meta: expect.objectContaining({ sha256: sha(mine), uploader: "Alex" }) });
+  expect(fake.downloads).toHaveLength(1);
+  expect((await call("/api/apps/9800/lua/meta")).body.sha256).toBe(sha(mine)); // the good entry stays current
+  // The download counted for the 30-minute rule.
+  expect((await ask("9800", sha(mine))).body.state).toBe("upstream_not_newer");
+  expect(fake.downloads).toHaveLength(1);
+  // Same pins but another manifest file is another build, and is stored.
+  running.db.run(sql`update hubcap_jobs set downloaded_at = ${Date.now() - REFETCH_WINDOW - 1000} where appid = '9800'`);
+  const more = zipOf([{ name: "9800.lua", data: lua("9800", "1111"), deflate: true }, { name: "9801_1111.manifest", data: "manifest 1111" },
+    { name: "9802_2222.manifest", data: "manifest 2222" }]);
+  fake.manifests.set("9800", more);
+  await ask("9800", sha(mine));
+  expect(await settle("9800")).toEqual({ state: "ready", meta: expect.objectContaining({ sha256: sha(more) }) });
+});
+
+test("a throttled, blocked or failing status check moves on to the next key", async () => {
+  await pool([[K1, { usage: 0, limit: 10, statusCode: 503 }], [K2, { usage: 5, limit: 10 }]]);
+  fake.manifests.set("9810", pack("9810", "1"));
+  await ask("9810");
+  expect((await settle("9810")).state).toBe("ready");
+  expect(fake.statusCalls).toBe(2);
+  // A 429 on the status check marks that key out of quota; the download uses the other one.
+  await pool([[K1, { usage: 0, limit: 10, statusCode: 429 }], [K2, { usage: 5, limit: 10 }]]);
+  fake.manifests.set("9820", pack("9820", "1"));
+  await ask("9820");
+  expect((await settle("9820")).state).toBe("ready");
+  expect((await keyRow(K1)()).state).toBe("exhausted");
+  expect(fake.downloads.at(-1)).toEqual({ key: K2, appid: "9820" });
+  // Only when every key failed is the job unavailable, and nothing was downloaded.
+  await pool([[K1, { usage: 0, limit: 10, statusCode: 502 }], [K2, { usage: 0, limit: 10, statusCode: 500 }]]);
+  fake.manifests.set("9830", pack("9830", "1"));
+  const before = fake.downloads.length;
+  await ask("9830");
+  expect(await settle("9830")).toEqual({ state: "failed", error: "hubcap_unavailable" });
+  expect(fake.downloads).toHaveLength(before);
+});
+
+test("a download that broke after Hubcap answered counts against the 30-minute rule", async () => {
+  await pool([[K1, { usage: 0, limit: 10, breakBody: true }], [K2, { usage: 0, limit: 10 }]]);
+  fake.manifests.set("9840", pack("9840", "1"));
+  await ask("9840");
+  expect(await settle("9840")).toEqual({ state: "failed", error: "hubcap_unavailable" });
+  expect(fake.downloads).toEqual([{ key: K1, appid: "9840" }]); // not repeated with another key's quota
+  expect((await ask("9840")).body).toEqual({ state: "failed", error: "hubcap_unavailable" });
+  expect(fake.downloads).toHaveLength(1);
+});
+
+test("a dead-looking pool is re-checked once on the worker while requests wait only briefly", async () => {
+  await pool([[K1, { usage: 10, limit: 10 }], [K2, { usage: 3, limit: 3 }]]);
+  // A new day, with a slow stats answer for the key that comes back.
+  Object.assign(fake.keys.get(K1)!, { usage: 0, statsDelay: 3000 });
+  running.db.run(sql`update hubcap_keys set stats_at = ${Date.now() - STATS_TTL - 1000}`);
+  fake.statsCalls = 0;
+  const started = Date.now();
+  const answers = await Promise.all([call("/api/hubcap"), call("/api/hubcap"), ask("9850"), ask("9850", undefined, sam)]);
+  expect(Date.now() - started).toBeLessThan(3000); // bounded, not the 3 s stats call
+  expect(answers.map(a => a.body)).toEqual([{ enabled: false }, { enabled: false },
+    { state: "failed", error: "quota_exhausted" }, { state: "failed", error: "quota_exhausted" }]);
+  await until(async () => (await call("/api/hubcap")).body.enabled === true);
+  expect(fake.statsCalls).toBe(2); // one shared check: each due key once
+});
+
+test("a 403 from Hubcap only disables a key when its stats refuse it too", async () => {
+  // A blanket block on one key's download: the key stays, the job moves to the next key.
+  await pool([[K1, { usage: 0, limit: 10, downloadCode: 403 }], [K2, { usage: 5, limit: 10 }]]);
+  fake.manifests.set("9860", pack("9860", "1"));
+  await ask("9860");
+  expect((await settle("9860")).state).toBe("ready");
+  expect(fake.downloads).toEqual([{ key: K2, appid: "9860" }]);
+  expect(await keyRow(K1)()).toEqual(expect.objectContaining({ state: "usable", lastError: "hubcap_forbidden" }));
+  // Blocked everywhere: the job fails as unavailable and no key is disabled.
+  await pool([[K1, { usage: 0, limit: 10, statusCode: 403 }], [K2, { usage: 0, limit: 10, statusCode: 403 }]]);
+  fake.manifests.set("9870", pack("9870", "1"));
+  await ask("9870");
+  expect(await settle("9870")).toEqual({ state: "failed", error: "hubcap_unavailable" });
+  expect((await admin("adminHubcap")).keys.map((k: { state: string }) => k.state)).toEqual(["usable", "usable"]);
+  // A 403 the key's stats confirm: disabled, and the job still finishes with the other key.
+  await pool([[K1, { usage: 0, limit: 10, downloadCode: 403 }], [K2, { usage: 5, limit: 10 }]]);
+  fake.keys.get(K1)!.statsCode = 403;
+  fake.manifests.set("9875", pack("9875", "1"));
+  await ask("9875");
+  expect((await settle("9875")).state).toBe("ready");
+  expect(await keyRow(K1)()).toEqual(expect.objectContaining({ state: "disabled", disabled: "rejected" }));
+});
+
+test("keys are encrypted at rest with the server secret", async () => {
+  await pool([[K1, { usage: 0, limit: 10 }]]);
+  const stored = JSON.stringify(running.db.all(sql`select * from hubcap_keys`));
+  expect(stored).not.toContain(K1.slice(4, 40));
+  expect(stored).toContain("v1.");
+  // Each save gets a fresh IV: replacing a key with itself changes the ciphertext.
+  const id = (await keyRow(K1)()).id, sealed = () => (running.db.all(sql`select sealed from hubcap_keys`) as { sealed: string }[])[0]!.sealed;
+  const first = sealed();
+  await admin("updateHubcapKey", { id, key: K1 });
+  expect(sealed()).not.toBe(first);
+});
+
+test("without a valid server secret the relay is off and keys can't be saved", async () => {
+  await pool([[K1, { usage: 0, limit: 10 }]]);
+  fake.manifests.set("9880", pack("9880", "1"));
+  for (const [value, state] of [[undefined, "missing"], ["not base64!", "invalid"], [Buffer.alloc(16).toString("base64"), "invalid"]] as const) {
+    if (value === undefined) delete process.env.HUBCAP_KEY_SECRET; else process.env.HUBCAP_KEY_SECRET = value;
+    const view = await admin("adminHubcap");
+    expect(view).toEqual(expect.objectContaining({ secret: state, enabled: false, failure: "relay_disabled" }));
+    expect(view.keys).toHaveLength(1); // the list still shows (masks are not secret)
+    expect((await fn("m", "addHubcapKey", { key: K2 })).body.error.code).toBe("SECRET_NOT_SET");
+    expect((await call("/api/hubcap")).body).toEqual({ enabled: false });
+    expect((await ask("9880")).body).toEqual({ state: "failed", error: "relay_disabled" });
+    expect((await call("/api/admin/hubcap/check", { method: "POST", headers: identity() }, null)).status).toBe(409);
+  }
+  // Another secret can't open the stored key: it is marked unreadable and the relay stays off.
+  process.env.HUBCAP_KEY_SECRET = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
+  expect((await call("/api/admin/hubcap/check", { method: "POST", headers: identity() }, null)).status).toBe(200);
+  expect(await keyRow(K1)()).toEqual(expect.objectContaining({ state: "disabled", disabled: "unreadable", lastError: "key_unreadable" }));
+  expect((await ask("9880")).body).toEqual({ state: "failed", error: "relay_disabled" });
+  // The right secret again: the key opens, is re-checked and works.
+  process.env.HUBCAP_KEY_SECRET = keySecret;
+  expect((await call("/api/admin/hubcap/check", { method: "POST", headers: identity() }, null)).status).toBe(200);
+  expect((await keyRow(K1)()).state).toBe("usable");
+  await ask("9880");
+  expect((await settle("9880")).state).toBe("ready");
+});
+
 test("finished jobs are pruned after a day", async () => {
   running.db.run(sql`insert into hubcap_jobs (id, appid, seq, state, created_at, finished_at) values ('old', '1', 0, 'failed', 0, ${Date.now() - JOB_RETENTION - 1})`);
   running.db.run(sql`insert into hubcap_requesters (job_id, user_id, requested_at) select 'old', id, 0 from users limit 1`);
@@ -392,4 +542,5 @@ test("no key ever appears in a response or a log line", () => {
     expect(all).not.toContain(k.slice(4, 40));
   }
   expect(all).not.toContain("api_key=");
+  expect(all).not.toContain(keySecret);
 });

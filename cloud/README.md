@@ -220,11 +220,37 @@ replace a key or remove it. The key field is write-only: after saving, the admin
 today's usage and limit, expiry and the last error. **Check keys** re-reads every key's stats now
 (`POST /api/admin/hubcap/check`, creator session only); otherwise stats are re-read at most every
 5 minutes and after each download. Keys are stored in the `hubcap_keys` table (migration
-`20261115153928_hubcap_relay`), not in Bedrock secrets: secrets are set through the daemon's
+`20261115161651_hubcap_relay`), not in Bedrock secrets: secrets are set through the daemon's
 management API or CLI with a deploy token and reach the pebble only as environment variables at the
 next (re)start, so a pebble cannot write its own secret at runtime, and a list of keys with labels
-and per-key state needs rows anyway. The database (and so the keys) is in Bedrock's backups; treat
-those as sensitive. Clients only learn `{ enabled }`.
+and per-key state needs rows anyway. Clients only learn `{ enabled }`.
+
+**Keys are encrypted at rest** (`hubcap-crypto.ts`): AES-256-GCM with a random IV per save, plus an
+HMAC-SHA256 digest (unique column) so a duplicate is refused without decrypting anything; only the
+last 4 characters are stored in the clear, for the mask. Both subkeys are derived (HKDF-SHA256) from
+one pebble secret, `HUBCAP_KEY_SECRET`: 32 random bytes, base64. Database backups therefore hold
+only ciphertext; the secret lives in `$BEDROCK_HOME/pebbles/cabinet/secrets.json`, outside data
+backups (back it up separately, or re-enter the keys after losing it). **Set it before the first
+deploy that includes the relay**, from the machine where you ran `bedrock login mc2.onl`:
+
+```sh
+# Linux/macOS: generate 32 random bytes and pipe them in (the value never touches argv)
+openssl rand -base64 32 | tr -d '\n' | bedrock secrets set cabinet HUBCAP_KEY_SECRET
+```
+
+```powershell
+# Windows PowerShell
+[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)) | bedrock secrets set cabinet HUBCAP_KEY_SECRET
+```
+
+`bedrock secrets set` reads the value from stdin (or a hidden prompt if you run it alone and paste)
+and can be staged before the first deploy; `bedrock secrets ls cabinet` lists it without the value.
+Secrets reach the pebble only when it starts, so an already-deployed pebble needs a restart: add
+`--restart` to the command (it requires a deployed pebble). Leading/trailing whitespace is ignored.
+Without a valid secret nothing crashes: the relay reports `{ enabled: false }`, requests fail with
+`relay_disabled`, and `/admin` shows **Server secret not set** (or **invalid**) and refuses to save
+keys. Changing the secret makes stored keys unreadable: they show **Can’t decrypt** and are skipped
+until the old secret is back or the keys are entered again. The secret is never logged.
 
 **Queue**: `hubcap_jobs` (one job per app while queued or running, FIFO by `seq`) and
 `hubcap_requesters` (who asked; names shown in the admin under the job). The worker is an
@@ -239,8 +265,16 @@ stored with `storeLua` (the same retention) as source `Hubcap (Cabinet)` with no
 (`lua_cache.user_id` is null; meta shows `Cabinet Cloud`). Upstream failures are recorded as short
 codes; no exception text (which could quote the manifest URL and so the key) is logged or stored.
 
+Before storing, the package's build (active pins plus `<depot>_<manifest>.manifest` file names) is
+compared with the current cached copy: the same build in other bytes ends `upstream_not_newer` and
+is not stored, so a still-stale Hubcap build never replaces a good entry or reaches clients as
+`ready`.
+
 `bun test` (`hubcap.test.ts`, with a fake Hubcap) covers joining and one download per app, FIFO,
-restart re-queueing, the 30-minute rule, the stale-SHA rule, `no_manifest` and quota paths that spend
-no download, validation shared with the upload route, choosing the key with the most quota, rotation
-on 429, disabled keys, the all-exhausted fast fail and recovery, creator-only key management, and
-that no key appears in any response or log line.
+restart re-queueing, the 30-minute rule, the stale-SHA rule, the same-build rule, `no_manifest` and
+quota paths that spend no download, a broken body still counting as a download, validation shared
+with the upload route, choosing the key with the most quota, rotation on 429 (status and download)
+and on status failures, 403s confirmed by stats before a key is disabled, disabled keys, the
+all-exhausted fast fail and its single-flight, bounded recovery, encryption at rest and the
+missing/invalid/changed secret, creator-only key management, and that no key or secret appears in
+any response or log line.

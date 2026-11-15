@@ -14,14 +14,15 @@ const KEY_FORMAT = /^smm_[0-9a-f]{96}$/;
 const ERRORS: Record<string, string> = {
   no_manifest: "Hubcap has no manifest", quota_exhausted: "Daily limit reached", key_expired: "Key expired",
   key_rejected: "Key rejected", relay_disabled: "No usable key", hubcap_unavailable: "Hubcap unavailable",
-  invalid_package: "Package refused", stats_unavailable: "Stats unavailable",
+  invalid_package: "Package refused", stats_unavailable: "Stats unavailable", hubcap_forbidden: "Blocked by Hubcap (key still valid)",
+  key_unreadable: "Can’t decrypt (server secret changed)",
 };
 const errorText = (code: string | null) => code ? ERRORS[code] ?? code : "";
 
 function KeyState({ row }: { row: Key }) {
   if (row.state === "usable") return <Badge tone="success" icon={<span className="cab-dot" />}>{row.checkedAt ? "Usable" : "Checking…"}</Badge>;
   if (row.state === "exhausted") return <Badge tone="warning" icon={<span className="cab-dot" />}>Limit reached</Badge>;
-  return <Badge tone="danger" icon={<span className="cab-dot" />}>{row.disabled === "expired" ? "Expired" : "Rejected"}</Badge>;
+  return <Badge tone="danger" icon={<span className="cab-dot" />}>{row.disabled === "expired" ? "Expired" : row.disabled === "unreadable" ? "Can’t decrypt" : "Rejected"}</Badge>;
 }
 function JobState({ job }: { job: Job }) {
   if (job.state === "queued") return <Badge>Queued #{job.position}</Badge>;
@@ -52,11 +53,13 @@ export function HubcapPanel() {
   return <section className="cab-stack">
     <div className="cab-row-between cab-section-title">
       <div><h2>Hubcap relay</h2><p className="cab-desc">Users get Hubcap Lua configs through this server with these keys. Each game is fetched once into the shared cache.</p></div>
-      <div className="cab-inline">{data && data.keys.length > 0 && <Button variant="secondary" loading={checking} onClick={() => void check()}><Icon name="refresh" />Check keys</Button>}
-        <Button onClick={() => setEditing("new")}><Icon name="add" />Add key</Button></div>
+      <div className="cab-inline">{data && data.keys.length > 0 && <Button variant="secondary" loading={checking} disabled={data.secret !== "ok"} onClick={() => void check()}><Icon name="refresh" />Check keys</Button>}
+        <Button disabled={!data || data.secret !== "ok"} onClick={() => setEditing("new")}><Icon name="add" />Add key</Button></div>
     </div>
     {error && <Alert tone="danger" title="Couldn’t load the relay" description={error.message} />}
-    {data && !data.enabled && data.keys.length > 0 && <Alert tone="warning" title={`Relay paused: ${errorText(data.failure).toLowerCase()}`}
+    {data && data.secret !== "ok" && <Alert tone="danger" title={data.secret === "missing" ? "Server secret not set" : "Server secret is invalid"}
+      description="Keys are encrypted with the pebble secret HUBCAP_KEY_SECRET (32 random bytes, base64). Until it is set, the relay is off and keys can’t be saved. See cloud/README.md, “Hubcap relay”." />}
+    {data && data.secret === "ok" && !data.enabled && data.keys.length > 0 && <Alert tone="warning" title={`Relay paused: ${errorText(data.failure).toLowerCase()}`}
       description="Requests fail at once until a key can make requests again. Stats are re-checked every few minutes." />}
     {data && <Card className="cab-table-card">{data.keys.length === 0
       ? <p className="cab-desc cab-pad">No keys yet. Add a Hubcap API key to turn the relay on.</p>

@@ -264,37 +264,51 @@ not their usage. Download a `ready` package with `GET /api/apps/<appid>/lua?sha2
   client may fall back to the cached copy), or the earlier failure when nothing is cached. A recent
   `no_manifest` is likewise repeated without asking Hubcap again.
 - When no key in the pool is usable the request fails at once (`quota_exhausted`, `key_expired`,
-  `key_rejected`, or `relay_disabled` with no keys) and no job is queued. Stats are re-checked at
-  most every 5 minutes, so the relay resumes on its own when a key may make requests again.
+  `key_rejected`, or `relay_disabled` with no keys or no server key secret) and no job is queued.
+  When stats are due (older than 5 minutes), one shared re-check runs on the worker; requests wait
+  for it at most about 2 seconds and otherwise answer from what is known, so the relay resumes on
+  its own when a key may make requests again.
 - Otherwise a job is queued (`{ "state": "queued", "position": n }`).
 
 **The worker** runs one job at a time, oldest first, outside the database write queue:
 
 1. The same rules again (a newer copy or a recent download since queuing settles the job for free).
-2. Free status check (`GET /api/v1/status/<appid>`) with any key that isn't disabled. No manifest:
-   `no_manifest`, no download spent.
+2. Free status check (`GET /api/v1/status/<appid>`), trying every key that isn't disabled until one
+   answers. No manifest: `no_manifest`, no download spent. A `429` marks that key exhausted, a `5xx`
+   or timeout moves on; only when every key failed does the job fail (`hubcap_unavailable`, or the
+   pool's code).
 3. Pick the usable key with the most remaining daily quota (cached stats, re-read at most every
    5 minutes and after each download) and download `GET /api/v1/manifest/<appid>`. A `429` marks
    that key exhausted (until its stats allow requests again) and the same job retries with the next
-   usable key; a `401`/`403` marks it disabled. When no key is left the job fails with the pool's
-   code. Content-Disposition is ignored (titles are not safe file names).
+   usable key; a `401` marks it disabled; a `5xx` or timeout before Hubcap answered tries the next
+   key. When no key is left the job fails with the pool's code (or `hubcap_unavailable`). A `200`
+   counts as a download (30-minute rule) as soon as it arrives, even if the body then fails.
+   Content-Disposition is ignored (titles are not safe file names).
+   A `403` on a status or manifest call is not trusted on its own (a challenge page blocks every key
+   alike): the key's stats are asked, and the key is disabled only if stats also refuse it.
 4. Validate with the **same check as the Lua cache upload** (`inspectLua` in `lua.ts`); a refused
    package fails `invalid_package`.
-5. Store it as the app's current cache version (`source: "Hubcap (Cabinet)"`, uploader the server,
-   retention 3 versions like any upload): `ready`. The same SHA-256 as the current entry changes
-   nothing: `upstream_not_newer`.
+5. Compare its build (active pins plus `<depot>_<manifest>.manifest` names) with the current cache
+   entry: the same SHA-256 or the same build in other bytes is `upstream_not_newer` and is **not**
+   stored (Hubcap is still on the cached build). Otherwise store it as the app's current cache version
+   (`source: "Hubcap (Cabinet)"`, uploader the server, retention 3 versions like any upload): `ready`.
 
 A job left `running` by a stopped server is queued again at startup. Finished jobs are pruned after
-a day. Keys never appear in responses, errors, admin views (only `smm_…` plus the last 4 characters)
-or logs; upstream failures are recorded as the codes above.
+a day. Keys are encrypted at rest with the pebble secret `HUBCAP_KEY_SECRET` and never appear in
+responses, errors, admin views (only `smm_…` plus the last 4 characters) or logs; upstream failures
+are recorded as the codes above.
 
 Client rules (LuaTools, provider **Cabinet**): the provider is listed only while Cabinet Cloud is
 connected and `GET /api/hubcap` says enabled; it needs no key of the user. A current cached copy is
-installed directly. Otherwise the client POSTs (with `stale=` when its copy was stale), polls `GET`
-about every 2 s showing the queue position, downloads exactly `meta.sha256`, verifies it and
-installs it through the normal validation. On `upstream_not_newer` it asks the user whether to
-install the cached copy anyway. Cancelling stops the client only (the job continues for others);
-the client gives up after about 10 minutes. A package that came from Cabinet is never uploaded back.
+installed directly. A cached copy whose build can't be checked (Steam's depot info unavailable) is
+never reported stale: the user is asked whether to install it unchecked (agent adds don't). Otherwise
+the client POSTs (with `stale=` only when its copy is verifiably stale), polls `GET` about every 2 s
+showing the queue position, re-checks the returned copy against Steam, downloads exactly
+`meta.sha256`, verifies it and installs it through the normal validation. On `upstream_not_newer`, or
+a `ready` copy that is still behind Steam, it asks whether to install that copy anyway. A cached
+copy the client can't download is a server error, not a stale copy. Cancelling stops the client only
+(the job continues for others); the client gives up after about 10 minutes. A package that came
+from Cabinet is never uploaded back.
 
 ## Pairing codes
 

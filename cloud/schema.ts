@@ -84,8 +84,11 @@ export const luaCache = sqliteTable("lua_cache", {
 
 // Hubcap relay (hubcap.ts, docs/cloud-api.md "Hubcap relay"): the owner's pool of Hubcap API keys. A key
 // never leaves the server: the admin sees a mask, clients only learn whether the relay is enabled.
+// `sealed` is the key encrypted with HUBCAP_KEY_SECRET (hubcap-crypto.ts), `digest` its HMAC for
+// duplicate detection, `hint` its last 4 characters for the admin's mask.
 export const hubcapKeys = sqliteTable("hubcap_keys", {
-  id: text("id").primaryKey(), key: text("key").notNull(), label: text("label"),
+  id: text("id").primaryKey(), sealed: text("sealed").notNull(), digest: text("digest").notNull().unique(),
+  hint: text("hint").notNull(), label: text("label"),
   addedAt: integer("added_at").notNull(),
   // Cached /api/v1/user/stats; statsAt 0 = not checked yet.
   dailyUsage: integer("daily_usage"), dailyLimit: integer("daily_limit"), canMakeRequests: integer("can_make_requests"),
