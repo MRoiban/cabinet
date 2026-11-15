@@ -161,6 +161,56 @@ selects `"provider": "cabinet"`; the credential document (`tokens_cabinet.json` 
 default) is `{ "server": "https://cabinet.<domain>", "token": "cab_…" }`. The
 `cloud_redirect_cli cabinet-connect <connect link>` command writes both.
 
+## Lua config cache (LuaTools)
+
+LuaTools users connected to a server share the game configs (manifest packages: one `.lua` plus
+Steam `.manifest` files) they download. After a successful install from a normal source, LuaTools
+uploads the package it installed; when anyone on the server later adds that game, LuaTools checks
+the server first and installs the cached copy if it matches the game's current Steam build. Unlike
+saves, these rows are **shared across all token-users of the server**: anyone can read any app's
+cached package, and any user's newer upload replaces it.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| PUT | `/api/apps/<appid>/lua?sha256=&source=&deviceId=` | the package zip (`application/zip`, max 90 MiB) | `LuaMeta` |
+| GET | `/api/apps/<appid>/lua/meta` | | `LuaMeta`; `404 {"error":"not_found"}` if none |
+| GET | `/api/apps/<appid>/lua[?sha256=<hex>]` | | zip bytes, `ETag: <sha256>`; `404` if none (or that version is no longer kept) |
+
+```
+LuaMeta = { appid, sha256, size, pins: { "<depotId>": "<manifestId>" }, source, uploadedAt: unixMs, uploader }
+```
+
+- `uploader` is the uploading user's display name. Their user id and device stay private (the device
+  is stored for the admin's benefit only).
+- `pins` are read by the server from the package's lua, never taken from the request, so meta always
+  describes the bytes: every `setManifestid(<depot>, "<manifest>")`, with an active line winning over
+  a commented one (LuaTools' "Auto Update Apps" comments pins out), sorted by depot.
+- `source` is the source the uploader downloaded from (1–64 characters, no control characters).
+  `deviceId` follows the save rules; the stored device name comes from that user's progress pushes.
+- The same SHA-256 as the current copy is a no-op: `200` with the current `LuaMeta` (nothing changes,
+  not even `uploadedAt`). Any other valid upload becomes current. The newest **3** versions per app
+  are kept; `GET …/lua?sha256=` can fetch a kept older one (so a reader can download exactly the
+  version whose meta it checked, even if someone uploads in between).
+- Validation (`400 {"error": message}`): `<appid>` digits only; `Content-Type: application/zip`;
+  body 1 byte–90 MiB whose SHA-256 equals `sha256`; a real ZIP (no ZIP64, encryption, multi-disk);
+  1–4096 entries, safe relative paths (no `..`, absolute or drive paths, reserved Windows names,
+  duplicates), no entry expanding beyond max(1 MiB, 200 × its compressed size), 256 MiB expanded
+  in total; files are exactly one `.lua` (max 2 MiB, UTF-8, only `addappid`/`addtoken`/
+  `setManifestid` lines and comments, no block strings, declaring `addappid(<appid>…)`),
+  `<depot>_<manifest>.manifest` files (max 64 MiB each) and `.txt`/`.md` documentation (max 256 KiB).
+  These mirror LuaTools' `ManifestContentPolicy`; the client still validates every package again
+  before installing, since a cached copy comes from another user.
+- **Size limit:** 90 MiB like saves (one Bedrock bucket ceiling, and Cabinet's existing response
+  cap). Real packages are a lua and a few compressed manifests, well under 10 MiB; the
+  client's own expanded ceiling (256 MiB) can only be approached by packages no source serves.
+- Writes need `Origin: https://cabinet.<domain>` like every other write.
+
+Client rules (LuaTools): only when connected to Cabinet; it checks `meta` first and uses the copy only
+if every pinned depot that Steam reports a public manifest for matches it (if Steam's depot info
+cannot be fetched, the copy is not used). It installs through the same validation as any other
+source and never re-uploads a copy it got from the cache. Uploads are automatic, in the background,
+and failures are only logged. Packages fetched with a user's personal Hubcap key are never uploaded.
+
 ## Pairing codes
 
 A pairing code lets a device connect by typing 12 characters instead of
