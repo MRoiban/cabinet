@@ -69,3 +69,14 @@ export const achievementSchemas = sqliteTable("achievement_schemas", {
   fetchedAt: integer("fetched_at").notNull(),
 });
 export type SchemaAchievement = { id: string; name: string; description: string; icon: string | null; iconGray: string | null; hidden: boolean; percent: number | null };
+
+// Shared Lua config cache (docs/cloud-api.md, "Lua config cache"): a game's manifest package as a
+// LuaTools user installed it, readable by every user of this server. The newest row per app is current.
+export const luaCache = sqliteTable("lua_cache", {
+  id: text("id").primaryKey(), appid: text("appid").notNull(),
+  fileId: text("file_id").notNull(), sha256: text("sha256").notNull(), size: integer("size").notNull(),
+  pins: text("pins", { mode: "json" }).$type<Record<string, string>>().notNull(),
+  source: text("source").notNull(), uploadedAt: integer("uploaded_at").notNull(),
+  userId: text("user_id").notNull().references(() => users.id),
+  deviceId: text("device_id").notNull(), deviceName: text("device_name").notNull(),
+}, t => [index("lua_cache_app_uploaded").on(t.appid, t.uploadedAt)]);
