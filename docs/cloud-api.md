@@ -181,7 +181,9 @@ LuaMeta = { appid, sha256, size, pins: { "<depotId>": "<manifestId>" }, source, 
 ```
 
 - `uploader` is the uploading user's display name. Their user id and device stay private (the device
-  is stored for the admin's benefit only).
+  is stored for the admin's benefit only). A package the server fetched itself through the
+  [Hubcap relay](#hubcap-relay-luatools) shows `"uploader": "Cabinet Cloud"` and
+  `"source": "Hubcap (Cabinet)"`.
 - `pins` are read by the server from the package's lua, never taken from the request, so meta always
   describes the bytes: every ACTIVE, full-line `setManifestid(<depot>, "<manifest>"[, size])` (double
   or single quotes, as LuaTools' install policy allows), sorted by depot. Commented-out lines and
@@ -220,6 +222,79 @@ current unless a manifest file it carries is stale); without Steam's depot info 
   that package is current (so an older build never replaces a newer copy). Never for a copy that
   came from the cache, nor for sources fetched with the user's own key (Hubcap, or any source the
   catalogue marks as needing a key). Failures are only logged.
+
+## Hubcap relay (LuaTools)
+
+The server owner keeps a pool of Hubcap API keys in `/admin`. Every token-user can then get a
+game's Hubcap Lua config through the server without a key of their own: the server queues the
+request, fetches the game from Hubcap **once**, stores it as the app's current
+[Lua cache](#lua-config-cache-luatools) entry and serves everyone from there. Five users asking for
+the same game cost one Hubcap download. There is no per-user cap; the keys' own daily limits are the
+only limit.
+
+| Method | Path | Response |
+|---|---|---|
+| GET | `/api/hubcap` | `{ "enabled": bool }`: at least one key in the pool can make requests |
+| POST | `/api/apps/<appid>/hubcap[?stale=<sha256>]` | `RelayStatus` (enqueue, join, or answer at once) |
+| GET | `/api/apps/<appid>/hubcap` | `RelayStatus` of the app's active job, else its latest job (kept a day); `404 {"error":"not_found"}` if none |
+
+```
+RelayStatus = { state: "queued" | "running" | "ready" | "failed" | "upstream_not_newer",
+                position?: n,        // queued only: 1 = runs next
+                error?: RelayError,  // failed only
+                meta?: LuaMeta }     // ready / upstream_not_newer: the Lua cache version to download
+RelayError = no_manifest | quota_exhausted | key_expired | key_rejected | relay_disabled
+           | hubcap_unavailable | invalid_package
+```
+
+Bearer auth like every `/api/*` route; the POST needs `Origin` like every write; `<appid>` digits
+only and `stale` 64 hex characters, else `400`. Clients learn nothing about the keys: not how many,
+not their usage. Download a `ready` package with `GET /api/apps/<appid>/lua?sha256=<meta.sha256>`.
+
+**Request rules** (the server can't see Steam's current build, so the client decides freshness):
+
+- The client sends `stale=<sha256>` when it found the cached copy stale, and nothing when the cache
+  has no entry for the app.
+- An active (queued or running) job for the app is **joined**: one job per app, every requester is
+  recorded (the admin shows their names), and the answer is that job's status.
+- A current cache entry whose SHA-256 differs from `stale` (someone already refreshed it, or the
+  client had none) answers `ready` with its meta at once, without a Hubcap call.
+- An app is downloaded from Hubcap at most once per **30 minutes**. Inside that window a request
+  answers `upstream_not_newer` with the current meta (Hubcap may still be on the old build; the
+  client may fall back to the cached copy), or the earlier failure when nothing is cached. A recent
+  `no_manifest` is likewise repeated without asking Hubcap again.
+- When no key in the pool is usable the request fails at once (`quota_exhausted`, `key_expired`,
+  `key_rejected`, or `relay_disabled` with no keys) and no job is queued. Stats are re-checked at
+  most every 5 minutes, so the relay resumes on its own when a key may make requests again.
+- Otherwise a job is queued (`{ "state": "queued", "position": n }`).
+
+**The worker** runs one job at a time, oldest first, outside the database write queue:
+
+1. The same rules again (a newer copy or a recent download since queuing settles the job for free).
+2. Free status check (`GET /api/v1/status/<appid>`) with any key that isn't disabled. No manifest:
+   `no_manifest`, no download spent.
+3. Pick the usable key with the most remaining daily quota (cached stats, re-read at most every
+   5 minutes and after each download) and download `GET /api/v1/manifest/<appid>`. A `429` marks
+   that key exhausted (until its stats allow requests again) and the same job retries with the next
+   usable key; a `401`/`403` marks it disabled. When no key is left the job fails with the pool's
+   code. Content-Disposition is ignored (titles are not safe file names).
+4. Validate with the **same check as the Lua cache upload** (`inspectLua` in `lua.ts`); a refused
+   package fails `invalid_package`.
+5. Store it as the app's current cache version (`source: "Hubcap (Cabinet)"`, uploader the server,
+   retention 3 versions like any upload): `ready`. The same SHA-256 as the current entry changes
+   nothing: `upstream_not_newer`.
+
+A job left `running` by a stopped server is queued again at startup. Finished jobs are pruned after
+a day. Keys never appear in responses, errors, admin views (only `smm_…` plus the last 4 characters)
+or logs; upstream failures are recorded as the codes above.
+
+Client rules (LuaTools, provider **Cabinet**): the provider is listed only while Cabinet Cloud is
+connected and `GET /api/hubcap` says enabled; it needs no key of the user. A current cached copy is
+installed directly. Otherwise the client POSTs (with `stale=` when its copy was stale), polls `GET`
+about every 2 s showing the queue position, downloads exactly `meta.sha256`, verifies it and
+installs it through the normal validation. On `upstream_not_newer` it asks the user whether to
+install the cached copy anyway. Cancelling stops the client only (the job continues for others);
+the client gives up after about 10 minutes. A package that came from Cabinet is never uploaded back.
 
 ## Pairing codes
 

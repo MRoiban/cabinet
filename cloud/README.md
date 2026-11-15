@@ -207,3 +207,40 @@ same package again is a no-op. Meta shows only the uploader's display name. The 
 like the archive routes. See [the client contract](../docs/cloud-api.md#lua-config-cache-luatools).
 `bun test` covers sharing across users, the no-op, replacement and retention with blob deletion,
 pin parsing and malformed packages.
+
+## Hubcap relay
+
+`hubcap.ts` lets every Cabinet user get Hubcap Lua configs through the owner's own Hubcap API keys
+(LuaTools' **Cabinet** provider). See [the client contract](../docs/cloud-api.md#hubcap-relay-luatools)
+for the routes and rules.
+
+**Keys** (`/admin` → **Hubcap relay**): add several, each with an optional label; edit a label,
+replace a key or remove it. The key field is write-only: after saving, the admin shows only
+`smm_…` and the last 4 characters, with per-key status (usable, limit reached, rejected or expired),
+today's usage and limit, expiry and the last error. **Check keys** re-reads every key's stats now
+(`POST /api/admin/hubcap/check`, creator session only); otherwise stats are re-read at most every
+5 minutes and after each download. Keys are stored in the `hubcap_keys` table (migration
+`20261115153928_hubcap_relay`), not in Bedrock secrets: secrets are set through the daemon's
+management API or CLI with a deploy token and reach the pebble only as environment variables at the
+next (re)start, so a pebble cannot write its own secret at runtime, and a list of keys with labels
+and per-key state needs rows anyway. The database (and so the keys) is in Bedrock's backups; treat
+those as sensitive. Clients only learn `{ enabled }`.
+
+**Queue**: `hubcap_jobs` (one job per app while queued or running, FIFO by `seq`) and
+`hubcap_requesters` (who asked; names shown in the admin under the job). The worker is an
+**exclusive Bedrock service** (`hubcapRelay`): exactly one runs, also across a deploy handoff, so jobs
+run one at a time. Network calls (status, stats, download) happen outside the database write queue;
+only the short bookkeeping and the final store take write slots. At startup a job left `running`
+is queued again; finished jobs are pruned after a day. Requests wake the worker; it also polls every
+10 seconds. The service keeps the pebble awake (like the hourly `appNames` job already did).
+
+The downloaded package goes through `inspectLua` (the Lua cache upload's own validation) and is
+stored with `storeLua` (the same retention) as source `Hubcap (Cabinet)` with no user
+(`lua_cache.user_id` is null; meta shows `Cabinet Cloud`). Upstream failures are recorded as short
+codes; no exception text (which could quote the manifest URL and so the key) is logged or stored.
+
+`bun test` (`hubcap.test.ts`, with a fake Hubcap) covers joining and one download per app, FIFO,
+restart re-queueing, the 30-minute rule, the stale-SHA rule, `no_manifest` and quota paths that spend
+no download, validation shared with the upload route, choosing the key with the most quota, rotation
+on 429, disabled keys, the all-exhausted fast fail and recovery, creator-only key management, and
+that no key appears in any response or log line.
