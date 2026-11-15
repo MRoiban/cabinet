@@ -104,7 +104,7 @@ export function inspectArchive(bytes: Uint8Array, appid: string): ArchiveManifes
   return { contentHash, files: manifest.files.length, bytes: bytesTotal };
 }
 
-export async function limitedBody(request: Request, limit = MAX_SAVE, tooLarge = "Save exceeds 90 MiB."): Promise<Uint8Array<ArrayBuffer>> {
+export async function limitedBody(request: Pick<Request, "headers" | "body">, limit = MAX_SAVE, tooLarge = "Save exceeds 90 MiB."): Promise<Uint8Array<ArrayBuffer>> {
   if (Number(request.headers.get("content-length")) > limit) invalid(tooLarge);
   const reader = request.body?.getReader();
   const chunks: Uint8Array[] = [];

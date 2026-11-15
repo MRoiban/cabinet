@@ -24,10 +24,38 @@ export interface LuaMeta {
   appid: string; sha256: string; size: number; pins: Record<string, string>;
   source: string; uploadedAt: number; uploader: string;
 }
-function luaMeta(ctx: FunctionContext, row: Row): LuaMeta {
+/** The uploader shown for packages the server fetched itself (the Hubcap relay), which no user uploaded. */
+export const SERVER_UPLOADER = "Cabinet Cloud";
+export function luaMeta(ctx: FunctionContext, row: Row): LuaMeta {
   const { appid, sha256, size, pins, source, uploadedAt } = row;
-  const uploader = ctx.db.select().from(users).where(eq(users.id, row.userId)).get()?.name ?? "";
+  const uploader = row.userId === null ? SERVER_UPLOADER
+    : ctx.db.select().from(users).where(eq(users.id, row.userId)).get()?.name ?? "";
   return { appid, sha256, size, pins, source, uploadedAt, uploader };
+}
+
+/** Who stored a version: a user's upload (their device), or the server itself (userId null). */
+export interface LuaUploader { userId: string | null; deviceId: string; deviceName: string }
+/**
+ * Makes a package validated by {@link inspectLua} the app's current version, keeping the newest
+ * {@link KEEP_LUA_VERSIONS}. The same package as the current one changes nothing (`stored` false).
+ * Runs inside a write slot; old blobs are deleted after the commit.
+ */
+export async function storeLua(slot: FunctionContext, appid: string, body: Uint8Array, sha256: string,
+  pins: Record<string, string>, source: string, uploader: LuaUploader): Promise<{ meta: LuaMeta; stored: boolean }> {
+  const all = luaVersions(slot, appid), current = all[0];
+  if (current && current.sha256 === sha256) return { meta: luaMeta(slot, current), stored: false };
+  return withInternalStorage(slot, async () => {
+    const file = await slot.storage.put(luaZips, new Blob([body as Uint8Array<ArrayBuffer>]), { name: `${appid}.zip`, mime: "application/zip" });
+    const values = { id: crypto.randomUUID(), appid, fileId: file.id, sha256, size: body.length, pins, source,
+      uploadedAt: Math.max(Date.now(), (current?.uploadedAt ?? 0) + 1), ...uploader };
+    slot.db.insert(luaCache).values(values).run();
+    // Retention: the newest KEEP_LUA_VERSIONS stay; blob deletion runs after the commit.
+    for (const old of all.slice(KEEP_LUA_VERSIONS - 1)) {
+      slot.db.delete(luaCache).where(eq(luaCache.id, old.id)).run();
+      await slot.storage.delete(luaZips, old.fileId);
+    }
+    return { meta: luaMeta(slot, values), stored: true };
+  });
 }
 export function luaVersions(ctx: FunctionContext, appid: string): Row[] {
   // uploadedAt is strictly increasing per app (see PUT), so it orders versions.
@@ -82,10 +110,10 @@ export function luaPins(text: string, appid: string): Record<string, string> {
 }
 
 /** Validates a manifest package (one .lua, Steam .manifest files, small .txt/.md docs) and reads its pins. */
-export function inspectLua(bytes: Uint8Array, appid: string): { pins: Record<string, string> } {
+export function inspectLua(bytes: Uint8Array, appid: string): { pins: Record<string, string>; manifests: string[] } {
   const entries = centralDirectory(bytes);
   if (!entries.length || entries.length > MAX_ENTRIES) invalid("Archive entry count exceeds its limit.");
-  const names = new Set<string>(), targets = new Set<string>();
+  const names = new Set<string>(), targets = new Set<string>(), manifests: string[] = [];
   let total = 0, lua: CentralEntry | null = null;
   for (const entry of entries) {
     if (entry.flags & 0x1) invalid("Encrypted ZIP entries are not supported.");
@@ -106,13 +134,22 @@ export function inspectLua(bytes: Uint8Array, appid: string): { pins: Record<str
       lua = entry;
     } else if (/\.manifest$/i.test(file)) {
       if (!MANIFEST_FILE.test(file) || entry.size > MAX_MANIFEST) invalid("Invalid Steam manifest entry.");
+      manifests.push(file.toLowerCase());
     } else invalid("A package may contain only Lua data, Steam manifests and plain text documentation.");
   }
   if (!lua) invalid("The package contains no Lua file.");
   let text: string;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(readEntry(bytes, lua, MAX_LUA)); }
   catch (error) { if (error instanceof TypeError) invalid("Lua is not UTF-8."); throw error; }
-  return { pins: luaPins(text, appid) };
+  return { pins: luaPins(text, appid), manifests: manifests.sort() };
+}
+
+/**
+ * The build a validated package describes: its active pins plus the `<depot>_<manifest>.manifest` files
+ * it carries. Two packages with the same build differ only in ways a client's freshness check ignores.
+ */
+export function sameBuild(a: { pins: Record<string, string>; manifests: string[] }, b: { pins: Record<string, string>; manifests: string[] }): boolean {
+  return JSON.stringify(a.pins) === JSON.stringify(b.pins) && JSON.stringify(a.manifests) === JSON.stringify(b.manifests);
 }
 
 export const luaRoutes: Record<string, DetachedRouteDefinition> = {
@@ -126,25 +163,11 @@ export const luaRoutes: Record<string, DetachedRouteDefinition> = {
     const body = await limitedBody(request, MAX_LUA_ARCHIVE, "Lua package exceeds 90 MiB.");
     if (new Bun.CryptoHasher("sha256").update(body).digest("hex") !== sha256) invalid("SHA-256 does not match the upload.");
     const { pins } = inspectLua(body, appid);
-    const meta = await ctx.write(async slot => {
+    const { meta } = await ctx.write(async slot => {
       const user = authenticate(slot);
-      const all = luaVersions(slot, appid), current = all[0];
       // The same package again (another user installing the cached copy's source) changes nothing.
-      if (current && current.sha256 === sha256) return luaMeta(slot, current);
       const device = slot.db.select().from(devices).where(and(eq(devices.userId, user.id), eq(devices.deviceId, deviceId))).get();
-      return withInternalStorage(slot, async () => {
-        const file = await slot.storage.put(luaZips, new Blob([body]), { name: `${appid}.zip`, mime: "application/zip" });
-        const values = { id: crypto.randomUUID(), appid, fileId: file.id, sha256, size: body.length, pins, source,
-          uploadedAt: Math.max(Date.now(), (current?.uploadedAt ?? 0) + 1), userId: user.id, deviceId,
-          deviceName: device?.name ?? deviceId };
-        slot.db.insert(luaCache).values(values).run();
-        // Retention: the newest KEEP_LUA_VERSIONS stay; blob deletion runs after the commit.
-        for (const old of all.slice(KEEP_LUA_VERSIONS - 1)) {
-          slot.db.delete(luaCache).where(eq(luaCache.id, old.id)).run();
-          await slot.storage.delete(luaZips, old.fileId);
-        }
-        return luaMeta(slot, values);
-      });
+      return storeLua(slot, appid, body, sha256, pins, source, { userId: user.id, deviceId, deviceName: device?.name ?? deviceId });
     });
     return json(meta);
   }),

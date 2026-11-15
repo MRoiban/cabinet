@@ -77,6 +77,40 @@ export const luaCache = sqliteTable("lua_cache", {
   fileId: text("file_id").notNull(), sha256: text("sha256").notNull(), size: integer("size").notNull(),
   pins: text("pins", { mode: "json" }).$type<Record<string, string>>().notNull(),
   source: text("source").notNull(), uploadedAt: integer("uploaded_at").notNull(),
-  userId: text("user_id").notNull().references(() => users.id),
+  // Null for a package the server fetched itself (the Hubcap relay, hubcap.ts): no user uploaded it.
+  userId: text("user_id").references(() => users.id),
   deviceId: text("device_id").notNull(), deviceName: text("device_name").notNull(),
 }, t => [index("lua_cache_app_uploaded").on(t.appid, t.uploadedAt)]);
+
+// Hubcap relay (hubcap.ts, docs/cloud-api.md "Hubcap relay"): the owner's pool of Hubcap API keys. A key
+// never leaves the server: the admin sees a mask, clients only learn whether the relay is enabled.
+// `sealed` is the key encrypted with HUBCAP_KEY_SECRET (hubcap-crypto.ts), `digest` its HMAC for
+// duplicate detection, `hint` its last 4 characters for the admin's mask.
+export const hubcapKeys = sqliteTable("hubcap_keys", {
+  id: text("id").primaryKey(), sealed: text("sealed").notNull(), digest: text("digest").notNull().unique(),
+  hint: text("hint").notNull(), label: text("label"),
+  addedAt: integer("added_at").notNull(),
+  // Cached /api/v1/user/stats; statsAt 0 = not checked yet.
+  dailyUsage: integer("daily_usage"), dailyLimit: integer("daily_limit"), canMakeRequests: integer("can_make_requests"),
+  expiresAt: text("expires_at"), statsAt: integer("stats_at").notNull().default(0),
+  // Out of quota (a 429, or stats saying so) until a later stats check allows requests again.
+  exhausted: integer("exhausted").notNull().default(0),
+  // "rejected" (401/403) or "expired": skipped until a stats check succeeds or the key is replaced.
+  disabled: text("disabled"),
+  lastError: text("last_error"), lastErrorAt: integer("last_error_at"), lastUsedAt: integer("last_used_at"),
+});
+// One job per appid while queued or running; seq orders the FIFO queue.
+export const hubcapJobs = sqliteTable("hubcap_jobs", {
+  id: text("id").primaryKey(), appid: text("appid").notNull(), seq: integer("seq").notNull(),
+  state: text("state").$type<HubcapState>().notNull(),
+  stale: text("stale"), error: text("error"), sha256: text("sha256"),
+  createdAt: integer("created_at").notNull(), startedAt: integer("started_at"), finishedAt: integer("finished_at"),
+  // When this job spent a Hubcap download on the app: the 30-minute re-fetch rule reads it.
+  downloadedAt: integer("downloaded_at"),
+}, t => [index("hubcap_jobs_app").on(t.appid, t.seq), index("hubcap_jobs_state").on(t.state, t.seq)]);
+export type HubcapState = "queued" | "running" | "ready" | "failed" | "upstream_not_newer";
+// Everyone who asked for a job (a second request for the same app joins it). Shown in the admin.
+export const hubcapRequesters = sqliteTable("hubcap_requesters", {
+  jobId: text("job_id").notNull().references(() => hubcapJobs.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id), requestedAt: integer("requested_at").notNull(),
+}, t => [primaryKey({ columns: [t.jobId, t.userId] })]);

@@ -8,4 +8,5 @@ export type Overview = ClientResult<Queries["adminOverview"]>;
 export type UserRow = Overview["users"][number];
 export type UserDetail = ClientResult<Queries["adminUser"]>;
 export type Created = ClientResult<Mutations["createUser"]>;
+export type HubcapView = ClientResult<Queries["adminHubcap"]>;
 export const linkFor = (path: string) => new URL(path, location.origin).href;
