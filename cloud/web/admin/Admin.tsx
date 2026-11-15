@@ -9,6 +9,7 @@ import type { Overview as Data, Pebble } from "./types";
 import { UsersTable } from "./UsersTable";
 import { UserSheet } from "./UserSheet";
 import { NewUserDialog } from "./NewUserDialog";
+import { HubcapPanel } from "./HubcapPanel";
 
 const client = createClient<Pebble>();
 
@@ -48,6 +49,7 @@ function Overview({ retry }: { retry: () => void }) {
         {data.playing.length > 0 && <Playing playing={data.playing} />}
         <Card className="cab-table-card"><UsersTable users={data.users} quota={data.quota} selected={selected} onSelect={setSelected} /></Card>
       </>}
+      {data && <HubcapPanel />}
     </main>
     <UserSheet id={selected} onClose={() => setSelected(null)} />
     <NewUserDialog open={creating} onOpenChange={setCreating} />

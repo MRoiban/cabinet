@@ -135,3 +135,7 @@ p { margin: 0; }
 .cab-ach-icon { width: 40px; height: 40px; border-radius: 4px; display: block; background: var(--onyx-surface-raised); }
 .cab-ach-locked .cab-strong { color: var(--onyx-text-foreground); }
 .cab-hidden-ach { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; border: 1px dashed var(--onyx-border-default); color: var(--onyx-text-description); }
+
+/* Hubcap relay panel (admin/HubcapPanel.tsx) */
+.cab-inline { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.cab-pad { padding: 8px 12px; margin: 0; }
