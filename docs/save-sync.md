@@ -34,6 +34,10 @@ Overrides live in `%LOCALAPPDATA%\Cabinet\save-overrides.json`. They have a `mod
 
 They can also turn sync off (`"sync": false`) or on (`"sync": true`) for one game.
 
+If the file is damaged (for example by a power loss) and no intact copy of an interrupted write is
+beside it, it is left in place and save sync pauses, and override edits are refused, until it is
+fixed or deleted: without it, games switched off would sync again and replaced folders would change.
+
 ### Manifest rules
 
 - Placeholders on Windows: `<home>`, `<osUserName>`, `<winAppData>`, `<winLocalAppData>`,
@@ -183,7 +187,9 @@ the error and retry next round; their journal does not advance.
 State lives in `%LOCALAPPDATA%\Cabinet\save-state.json`, separate from `cloud-state.json` so an
 older Cabinet rewriting its journal cannot drop it. Entries are per account (server + user id)
 and per AppID: `contentHash` (content known to match the cloud), `archiveId`, last upload,
-last download, last scan, status, error, conflict details.
+last download, last scan, status, error, conflict details. A damaged `save-state.json` is recovered
+from an interrupted write's leftover, else moved aside as `save-state.json.corrupt-<UTC>`; a fresh
+journal is safe, because without `J` differing local and cloud saves are a conflict, never an overwrite.
 
 Per eligible game, never while it runs (the existing checks plus Steam's `Running` registry flag
 and any process under the game's install folder):

@@ -76,6 +76,17 @@ ArchiveMeta = { id, sha256, contentHash, size, files, bytes, createdAt: unixMs, 
   - newer save from another device → only when that game is not running; zip the current local saves to
     `%LOCALAPPDATA%\Cabinet\backup\saves\<appid>\<timestamp>.zip` first, then replace.
 - Save/progress synchronization never runs while a game is running for that app. Network failures are silent (log only), retried next round.
+- State files (`cloud.json`, `cloud-state.json`, `playtime.txt`, `save-state.json`, …) are written to a temp file
+  that is flushed to disk before `File.Replace`, so a power loss cannot leave them zero-filled. A file that is
+  still unreadable at start is recovered from the newest parseable leftover of an interrupted write
+  (`<name>~RF*.TMP`, `<name>.<guid>.tmp`), else renamed `<name>.corrupt-<UTC>` and started afresh (`StateFile.cs`):
+  - a fresh `cloud-state.json` is marked `rebaseline`: the next round records the totals other devices already
+    have on the server as applied instead of adding them to Steam again. Minutes that had reached the server but
+    were not yet applied here are lost; that is preferred to double counting;
+  - a fresh `cloud.json` starts disconnected (connect again) and keeps the `deviceId` that `cloud-state.json`
+    remembers, and the same account's journal is kept on reconnect;
+  - a fresh `playtime.txt` records `#ledger-reset|<id>`; the cloud journal then counts the remote minutes it had
+    applied as imported (`importedBase`), so they are never pushed back as this PC's own playtime.
 
 ## Real-game presence
 
