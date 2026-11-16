@@ -440,7 +440,7 @@ namespace Cabinet
                     string temp = dest + ".cabinet-recover-" + Guid.NewGuid().ToString("N").Substring(0, 8);
                     try
                     {
-                        using (var s = new FileStream(temp, FileMode.CreateNew, FileAccess.Write)) backup.Extract(f, s);
+                        using (var s = new FileStream(temp, FileMode.CreateNew, FileAccess.Write)) { backup.Extract(f, s); s.Flush(true); }
                         if (File.Exists(dest)) File.Replace(temp, dest, null); else File.Move(temp, dest);
                     }
                     finally { TryDelete(temp); }

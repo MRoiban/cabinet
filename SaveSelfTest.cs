@@ -328,6 +328,28 @@ Odd Entry:
             Check(new SaveOverrides(Path.Combine(root, "d3", "data")).For("1000").paths.Single() == SaveUtil.Full(custom), "overrides persist");
             Throws<ArgumentException>(delegate { ovs.Set("1000", "replace", new[] { "relative\\path" }, null); }, "relative override paths refused");
             ovs.Reset("1000"); Check(new SaveOverrides(Path.Combine(root, "d3", "data")).For("1000") == null, "override reset");
+            // State damaged by a crash: overrides stay in place and pause saves; the save journal starts over.
+            string d3 = Path.Combine(root, "d3", "data"), overridesPath = Path.Combine(d3, "save-overrides.json");
+            ovs.Set("1000", "replace", new[] { custom }, false); File.WriteAllBytes(overridesPath, new byte[64]);
+            var damaged = new SaveOverrides(d3);
+            Check(damaged.Unreadable && damaged.For("1000") == null && File.ReadAllBytes(overridesPath).Length == 64, "unreadable overrides are left in place and pause saves");
+            Throws<InvalidOperationException>(delegate { damaged.Set("1000", "supplement", null, null); }, "edits refused while the overrides file is damaged");
+            File.WriteAllText(overridesPath + "~RF9.TMP", "{\"version\":1,\"games\":{\"steam:1000\":{\"mode\":\"replace\",\"paths\":[],\"sync\":false}}}");
+            var restored = new SaveOverrides(d3);
+            Check(!restored.Unreadable && restored.For("1000").sync == false, "overrides recovered from File.Replace's backup");
+            // A missing file with only a junk temp beside it is simply missing; repair or deletion resumes saves at once.
+            string valid = File.ReadAllText(overridesPath); File.Delete(overridesPath + "~RF9.TMP"); File.Delete(overridesPath);
+            File.WriteAllBytes(overridesPath + "." + Guid.NewGuid().ToString("N") + ".tmp", new byte[10]);
+            Check(!new SaveOverrides(d3).Unreadable && Directory.GetFiles(d3, "save-overrides.json.*.tmp").Length == 0, "missing overrides with only a junk temp file are missing; the junk is removed");
+            File.WriteAllBytes(overridesPath, new byte[64]); var live = new SaveOverrides(d3);
+            Check(live.Unreadable, "damaged overrides pause saves");
+            File.Delete(overridesPath);
+            Check(!live.Unreadable, "deleting the damaged overrides file resumes saves without a restart");
+            File.WriteAllBytes(overridesPath, new byte[64]); live = new SaveOverrides(d3); File.WriteAllText(overridesPath, valid);
+            Check(!live.Unreadable && live.For("1000").sync == false, "repairing the overrides file resumes saves without a restart");
+            File.WriteAllText(Path.Combine(d3, "save-state.json"), "{\"version\":1,\"accounts\":{\"local\":{\"1000\":{\"contentHash\":\"ab");
+            var fresh = new SaveSync(d3, delegate { }, delegate { return e; });
+            Check(fresh.App("1000").contentHash == null && Directory.GetFiles(d3, "save-state.json.corrupt-*").Length == 1, "truncated save journal quarantined; fresh journal");
 
             // Missing, empty, unavailable, denied, links.
             var m = Env(Path.Combine(root, "d4"), "Dan");
