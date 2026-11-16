@@ -21,13 +21,7 @@ namespace Cabinet
         internal static string Sha256(string text) { return Sha256(new UTF8Encoding(false).GetBytes(text)); }
         internal static string Hex(byte[] hash) { return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant(); }
         internal static long Now() { return (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds; }
-        internal static void AtomicWrite(string path, byte[] bytes)
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
-            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            using (var s = new FileStream(temp, FileMode.CreateNew, FileAccess.Write)) { s.Write(bytes, 0, bytes.Length); s.Flush(true); }
-            if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
-        }
+        internal static void AtomicWrite(string path, byte[] bytes) { StateFile.Write(path, bytes); }
         internal static void AtomicWrite(string path, string text) { AtomicWrite(path, new UTF8Encoding(false).GetBytes(text)); }
         internal static string Json(string s)
         {
@@ -564,15 +558,24 @@ namespace Cabinet
     {
         readonly string path; readonly object gate = new object(); SaveOverrideFile file = new SaveOverrideFile();
         static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
-        internal SaveOverrides(string dataDir)
+        // The file was damaged and nothing intact was found. It stays in place: without it, games the
+        // user switched off would sync again and replaced save folders would change, so save sync
+        // pauses and edits are refused until the file is fixed or deleted.
+        internal readonly bool Unreadable;
+        internal SaveOverrides(string dataDir) : this(dataDir, null) { }
+        internal SaveOverrides(string dataDir, Action<string> log)
         {
             path = Path.Combine(dataDir, "save-overrides.json");
-            if (File.Exists(path))
+            StateLoad loaded;
+            file = StateFile.Load(path, delegate(string text)
             {
-                file = Json.Deserialize<SaveOverrideFile>(File.ReadAllText(path)) ?? new SaveOverrideFile();
-                if (file.games == null) file.games = new Dictionary<string, SaveOverride>();
-            }
+                var f = Json.Deserialize<SaveOverrideFile>(text);
+                if (f != null && f.games == null) f.games = new Dictionary<string, SaveOverride>();
+                return f != null && f.games.Values.All(o => o != null) ? f : null;
+            }, log, out loaded, false) ?? new SaveOverrideFile();
+            Unreadable = loaded == StateLoad.Damaged;
         }
+        void Writable() { if (Unreadable) throw new InvalidOperationException("save-overrides.json is damaged; fix or delete it first"); }
         internal static string GameId(string appid) { return "steam:" + appid; }
         internal SaveOverride For(string appid)
         {
@@ -591,6 +594,7 @@ namespace Cabinet
                 if (string.IsNullOrEmpty(p) || !Path.IsPathRooted(p) || p.StartsWith(@"\\")) throw new ArgumentException("Override folders must be absolute local paths");
                 clean.Add(SaveUtil.Full(p));
             }
+            Writable();
             lock (gate)
             {
                 file.games[GameId(appid)] = new SaveOverride { mode = mode, paths = clean.Distinct(SaveUtil.PathComparer).ToList(), sync = sync };
@@ -599,6 +603,7 @@ namespace Cabinet
         }
         internal void Reset(string appid)
         {
+            Writable();
             lock (gate) { if (file.games.Remove(GameId(appid))) SaveUtil.AtomicWrite(path, Json.Serialize(file)); }
         }
     }

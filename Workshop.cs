@@ -262,18 +262,7 @@ namespace Cabinet
                 catch (Exception ex) { Once(file, L.T("Invalid Workshop profiles ignored: ", "Profils Workshop invalides ignorés : ") + file + " - " + ex.Message); }
             }
         }
-        internal static void AtomicWrite(string path, string text)
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
-            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try
-            {
-                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                { byte[] bytes = Encoding.UTF8.GetBytes(text); stream.Write(bytes, 0, bytes.Length); stream.Flush(true); }
-                if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
-            }
-            finally { if (File.Exists(temp)) File.Delete(temp); }
-        }
+        internal static void AtomicWrite(string path, string text) { StateFile.Write(path, text); }
         void Save() { AtomicWrite(journal, new JavaScriptSerializer().Serialize(owned)); }
         void Once(string key, string message) { if (reported.Add(key + "|" + message)) log(message); }
 

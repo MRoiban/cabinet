@@ -61,7 +61,7 @@ namespace Cabinet
             if (!live && running.Count == 0 && (closed || DateTime.UtcNow >= retry) && File.Exists(lastPath))
             {
                 retry = DateTime.UtcNow.AddMinutes(1);
-                var last = json.Deserialize<LastGame>(File.ReadAllText(lastPath));
+                StateLoad loaded; var last = StateFile.Load(lastPath, delegate(string text) { return json.Deserialize<LastGame>(text); }, log, out loaded);
                 if (last != null && last.Account == account) Apply(last.App, account);
             }
             return null;
@@ -324,7 +324,7 @@ namespace Cabinet
             string temporary = path + ".cabinet-controller-" + Guid.NewGuid().ToString("N");
             try
             {
-                if (after != null) File.WriteAllBytes(temporary, after);
+                if (after != null) StateFile.WriteFlushed(temporary, after);
                 if (!Same(before, Read(path))) throw new IOException("Steam changed controller file during preparation; retry later");
                 if (before != null)
                 {
@@ -389,13 +389,7 @@ namespace Cabinet
             }
         }
         static void Save(string path, string text) { byte[] bytes = Utf8.GetBytes(text); if (!Same(Read(path), bytes)) SaveBytes(path, bytes); }
-        static void SaveBytes(string path, byte[] bytes)
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
-            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try { File.WriteAllBytes(temp, bytes); if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path); }
-            finally { if (File.Exists(temp)) File.Delete(temp); }
-        }
+        static void SaveBytes(string path, byte[] bytes) { StateFile.Write(path, bytes); }
 
         // Read-only appinfo v28/v29 reader, bounded to the requested record. v29 uses
         // indexed string keys. Unknown formats are refused rather than guessed.
