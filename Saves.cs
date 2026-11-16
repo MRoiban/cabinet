@@ -558,22 +558,45 @@ namespace Cabinet
     {
         readonly string path; readonly object gate = new object(); SaveOverrideFile file = new SaveOverrideFile();
         static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
-        // The file was damaged and nothing intact was found. It stays in place: without it, games the
-        // user switched off would sync again and replaced save folders would change, so save sync
-        // pauses and edits are refused until the file is fixed or deleted.
-        internal readonly bool Unreadable;
+        // The file is damaged and nothing intact was found. It stays in place: without it, games the user
+        // switched off would sync again and replaced save folders would change, so save sync pauses and
+        // edits are refused until the file is fixed or deleted. Checked again whenever the file changes.
+        readonly Action<string> log; bool unreadable; DateTime stamp; long length;
         internal SaveOverrides(string dataDir) : this(dataDir, null) { }
-        internal SaveOverrides(string dataDir, Action<string> log)
+        internal SaveOverrides(string dataDir, Action<string> logger)
         {
-            path = Path.Combine(dataDir, "save-overrides.json");
+            path = Path.Combine(dataDir, "save-overrides.json"); log = logger;
+            Load();
+        }
+        void Load()
+        {
             StateLoad loaded;
-            file = StateFile.Load(path, delegate(string text)
+            var next = StateFile.Load(path, delegate(string text)
             {
                 var f = Json.Deserialize<SaveOverrideFile>(text);
                 if (f != null && f.games == null) f.games = new Dictionary<string, SaveOverride>();
                 return f != null && f.games.Values.All(o => o != null) ? f : null;
-            }, log, out loaded, false) ?? new SaveOverrideFile();
-            Unreadable = loaded == StateLoad.Damaged;
+            }, log, out loaded, OnDamage.Keep) ?? new SaveOverrideFile();
+            lock (gate)
+            {
+                file = next; unreadable = loaded == StateLoad.Damaged;
+                var info = new FileInfo(path); stamp = info.Exists ? info.LastWriteTimeUtc : DateTime.MinValue; length = info.Exists ? info.Length : -1;
+            }
+        }
+        internal bool Unreadable
+        {
+            get
+            {
+                bool changed;
+                lock (gate)
+                {
+                    if (!unreadable) return false;
+                    var info = new FileInfo(path);
+                    changed = !info.Exists || info.LastWriteTimeUtc != stamp || info.Length != length;
+                }
+                if (changed) Load();
+                lock (gate) return unreadable;
+            }
         }
         void Writable() { if (Unreadable) throw new InvalidOperationException("save-overrides.json is damaged; fix or delete it first"); }
         internal static string GameId(string appid) { return "steam:" + appid; }

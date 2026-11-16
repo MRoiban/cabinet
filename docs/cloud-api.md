@@ -79,14 +79,20 @@ ArchiveMeta = { id, sha256, contentHash, size, files, bytes, createdAt: unixMs, 
 - State files (`cloud.json`, `cloud-state.json`, `playtime.txt`, `save-state.json`, …) are written to a temp file
   that is flushed to disk before `File.Replace`, so a power loss cannot leave them zero-filled. A file that is
   still unreadable at start is recovered from the newest parseable leftover of an interrupted write
-  (`<name>~RF*.TMP`, `<name>.<guid>.tmp`), else renamed `<name>.corrupt-<UTC>` and started afresh (`StateFile.cs`):
+  (`<name>~RF*.TMP`, `<name>.<guid>.tmp`; one that cannot be read stops the load). Otherwise it stays in place
+  until fresh state replaces it, and that same `File.Replace` keeps it as `<name>.corrupt-<UTC>`, so the path is
+  never empty and a crash in between finds the damage again (`StateFile.cs`):
   - a fresh `cloud-state.json` is marked `rebaseline`: the next round records the totals other devices already
     have on the server as applied instead of adding them to Steam again. Minutes that had reached the server but
     were not yet applied here are lost; that is preferred to double counting;
-  - a fresh `cloud.json` starts disconnected (connect again) and keeps the `deviceId` that `cloud-state.json`
-    remembers, and the same account's journal is kept on reconnect;
-  - a fresh `playtime.txt` records `#ledger-reset|<id>`; the cloud journal then counts the remote minutes it had
-    applied as imported (`importedBase`), so they are never pushed back as this PC's own playtime.
+  - a fresh (damaged or missing) `cloud.json` keeps the `deviceId` that `cloud-state.json` remembers, and the
+    same account's journal is kept on reconnect. A journal from before IDs were recorded makes the next connect
+    take the ID from `/api/state` when exactly one device fits (a playtime device the journal never applied, else
+    a save/archive uploader with this PC's name); an ownerless journal is archived as
+    `cloud-account-unknown-*.json`, and while one exists fresh journals rebaseline;
+  - a fresh `playtime.txt` records `#ledger-reset|<id>`; at the next push the cloud journal counts as imported
+    (`importedBase`) the remote minutes it applied that the ledger no longer counts, capped by Steam's playtime
+    beyond this PC's pushed own minutes, so they are never pushed back as this PC's own playtime.
 
 ## Real-game presence
 

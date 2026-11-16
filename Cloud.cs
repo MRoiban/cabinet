@@ -42,7 +42,7 @@ namespace Cabinet
         static Func<ICollection<string>> detect;
         static Func<string> ledgerReset;
         static HashSet<string> running = new HashSet<string>();
-        static Dictionary<string, long> localMinutes = new Dictionary<string, long>();
+        static Dictionary<string, long> localMinutes = new Dictionary<string, long>(), importedMinutes = new Dictionary<string, long>();
         static volatile bool busy, requested;
         static bool wasPlaying;
         static DateTime next = DateTime.MinValue;
@@ -68,13 +68,15 @@ namespace Cabinet
             });
         }
         static readonly Queue<string> connects = new Queue<string>();
-        static CloudClient Client { get { if (client == null) client = new CloudClient(App.DataDir, Syncer.OnlineFixDir, LocalMinutes, Log); return client; } }
+        static CloudClient Client { get { if (client == null) client = new CloudClient(App.DataDir, Syncer.OnlineFixDir, LocalMinutes, Log) { Imported = ImportedMinutes }; return client; } }
         static void Log(string s) { if (logger != null) logger("cloud: " + s); }
         public static void Configure(Action<string> log, Func<string, string, int, bool> queueMinutes,
             Func<string, long> minutesInSteam, Func<ICollection<string>> runningApps, Func<string> ledgerResetMarker = null)
         { logger = log; queue = queueMinutes; imported = minutesInSteam; detect = runningApps; ledgerReset = ledgerResetMarker; }
         static long LocalMinutes(string app)
         { long value; return localMinutes.TryGetValue(app, out value) ? value : 0; }
+        static long ImportedMinutes(string app)
+        { long value; return importedMinutes.TryGetValue(app, out value) ? value : 0; }
         // Snapshot ledger provenance on the tray thread; its entries are not thread-safe.
         static long ReadLocalMinutes(string app)
         {
@@ -152,14 +154,17 @@ namespace Cabinet
             else if (TakeSaveAction(out action)) RunWorker(delegate { action(Client); }, "save action");
             else if (!anyGameRunning && Client.Connected && queue != null && imported != null && (requested || DateTime.UtcNow >= next))
             {
-                var snapshot = new Dictionary<string, long>();
+                var snapshot = new Dictionary<string, long>(); var imports = new Dictionary<string, long>();
                 try
                 {
                     if (Directory.Exists(Syncer.OnlineFixDir)) foreach (string folder in Directory.GetDirectories(Syncer.OnlineFixDir))
-                    { string id = Path.GetFileName(folder); if (Regex.IsMatch(id, @"^[0-9]{1,10}$") && !Blocked(id)) snapshot[id] = ReadLocalMinutes(id); }
+                    {
+                        string id = Path.GetFileName(folder);
+                        if (Regex.IsMatch(id, @"^[0-9]{1,10}$") && !Blocked(id)) { snapshot[id] = ReadLocalMinutes(id); imports[id] = imported(id); }
+                    }
                 }
                 catch (Exception ex) { Log("playtime snapshot failed: " + ex.Message); return result; }
-                localMinutes = snapshot;
+                localMinutes = snapshot; importedMinutes = imports;
                 requested = false; next = DateTime.UtcNow.AddMinutes(30); busy = true;
                 ThreadPool.QueueUserWorkItem(delegate
                 {
@@ -345,6 +350,14 @@ namespace Cabinet
                 LedgerRecoveredOrReset();
                 LedgerResetNeverPushesImportedMinutes();
                 DurableWritesLeaveNoTemporaryFiles();
+                DamageSurvivesACrashBeforeTheFreshWrite();
+                UnreadableLeftoverStopsTheLoad();
+                MissingSettingsKeepTheJournalsDevice();
+                LegacyJournalRecoversTheDeviceOnConnect();
+                JournalOfThePreviousAccountIsSwitchedOut();
+                LedgerResetAfterLaterImportsKeepsOwnMinutes();
+                LostPendingMinutesAreNotTakenAsImported();
+                EmptyLedgerFileIsAnEmptyLedger();
             }
             finally { SaveManifestCache.Fetcher = fetcher; }
             Console.WriteLine("Cabinet Cloud recovery self-test passed (temporary roots only).");
@@ -393,7 +406,7 @@ namespace Cabinet
                 var logs = new List<string>(); var client = Client(dir, Path.Combine(dir, "OnlineFix"), delegate { return 0; }, logs.Add);
                 string[] names = Names(dir);
                 Check(client.Rebaselining && names.Count(n => n.StartsWith("cloud-state.json.corrupt-")) == 1, "truncated journal quarantined; fresh journal marked rebaseline");
-                Check(File.ReadAllText(state).Contains("\"rebaseline\":true") && logs.Any(l => l.Contains("moved it to cloud-state.json.corrupt-")), "rebaseline persisted at once and the quarantine logged");
+                Check(File.ReadAllText(state).Contains("\"rebaseline\":true") && logs.Any(l => l.Contains("cloud-state.json was damaged and no intact copy was found")), "rebaseline persisted at once and the quarantine logged");
             });
         }
         internal static void DamagedJournalRebaselinesWithoutDoubleCounting()
@@ -478,7 +491,7 @@ namespace Cabinet
                     Func<string, string, int, bool> ledger = delegate(string receipt, string app, int n) { if (receipts.Add(receipt)) { steamB += n; importedB += n; } return true; };
                     Func<string, bool> idle = delegate { return false; }; Action<string> log = delegate { };
                     var a = Client(Path.Combine(root, "A", "data"), ar, delegate { return 12; }, log);
-                    var b = Client(Path.Combine(root, "B", "data"), br, delegate { return steamB - importedB; }, log);
+                    var b = Client(Path.Combine(root, "B", "data"), br, delegate { return steamB - importedB; }, log); b.Imported = delegate { return importedB; };
                     a.Connect(server.Origin + "/connect#" + FakeServer.Token); b.Connect(server.Origin + "/connect#" + FakeServer.Token);
                     a.Round(idle); b.Round(idle); b.Deliver(ledger, idle); b.Round(idle);
                     // B's ledger is lost: Steam still shows 19 minutes, but nothing says 12 of them came from A.
@@ -488,9 +501,172 @@ namespace Cabinet
                     Check(CloudClient.Num(CloudClient.Map(server.App["playtime"])[b.Device]) == 10, "B's own new minutes are still pushed after a ledger reset");
                     // Both the journal and the ledger lost: own minutes wait for the baseline, then exclude A's.
                     File.WriteAllBytes(Path.Combine(b.Data, "cloud-state.json"), new byte[64]); steamB += 2;
-                    b = Client(b.Data, br, delegate { return steamB - importedB; }, log); b.LedgerReset("reset-2"); b.Round(idle); b.Round(idle); b.Deliver(ledger, idle);
+                    b = Client(b.Data, br, delegate { return steamB - importedB; }, log); b.Imported = delegate { return importedB; }; b.LedgerReset("reset-2"); b.Round(idle); b.Round(idle); b.Deliver(ledger, idle);
                     Check(CloudClient.Num(CloudClient.Map(server.App["playtime"])[b.Device]) == 12 && steamB == 24, "journal and ledger both lost: no minutes double counted either way");
                 }
+            });
+        }
+        static string AnyJson(string text) { return text.StartsWith("{") ? text : null; }
+        internal static void DamageSurvivesACrashBeforeTheFreshWrite()
+        {
+            InTemp(delegate(string dir)
+            {
+                string state = Path.Combine(dir, "cloud-state.json"); File.WriteAllBytes(state, new byte[100]); StateLoad first, again, missing;
+                StateFile.Load<string>(state, AnyJson, null, out first);
+                Check(first == StateLoad.Damaged && File.ReadAllBytes(state).Length == 100 && !Names(dir).Any(n => n.Contains(".corrupt-")), "a damaged file stays in place until fresh state replaces it");
+                StateFile.Load<string>(state, AnyJson, null, out again);
+                Check(again == StateLoad.Damaged, "a crash before the fresh write finds the damage again, not a missing file");
+                StateFile.Write(state, "{}"); string corrupt = Names(dir).Single(n => n.StartsWith("cloud-state.json.corrupt-"));
+                Check(File.ReadAllText(state) == "{}" && File.ReadAllBytes(Path.Combine(dir, corrupt)).Length == 100, "the fresh write keeps the damaged copy as .corrupt in the same replace");
+                File.Delete(state); StateFile.Load<string>(state, AnyJson, null, out missing);
+                Check(missing == StateLoad.Damaged, "missing after a damaged copy was set aside counts as damaged");
+            });
+        }
+        internal static void UnreadableLeftoverStopsTheLoad()
+        {
+            InTemp(delegate(string dir)
+            {
+                string state = Path.Combine(dir, "cloud-state.json"), copy = state + "~RF42.TMP"; File.WriteAllBytes(state, new byte[100]); File.WriteAllText(copy, Journal);
+                bool threw = false; StateLoad result;
+                using (new FileStream(copy, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    try { StateFile.Load<string>(state, AnyJson, null, out result); } catch (IOException) { threw = true; }
+                Check(threw && File.ReadAllBytes(state).Length == 100 && File.Exists(copy) && !Names(dir).Any(n => n.Contains(".corrupt-")), "an intact leftover that cannot be read stops the load; nothing is moved");
+                Check(StateFile.Load<string>(state, AnyJson, null, out result) == Journal && result == StateLoad.Recovered, "once readable, that leftover is recovered");
+            });
+        }
+        internal static void MissingSettingsKeepTheJournalsDevice()
+        {
+            InTemp(delegate(string root)
+            {
+                using (var server = new FakeServer())
+                {
+                    string data = Path.Combine(root, "data"), of = Path.Combine(root, "OnlineFix"); Func<string, bool> idle = delegate { return false; };
+                    Seed(of, "A", 100, null, DateTime.UtcNow.AddHours(-2));
+                    var c = Client(data, of, delegate { return 4; }, delegate { }); c.Connect(server.Origin + "/connect#" + FakeServer.Token); c.Round(idle); string device = c.Device;
+                    File.Delete(Path.Combine(data, "cloud.json"));
+                    c = Client(data, of, delegate { return 4; }, delegate { });
+                    Check(!c.Connected && !c.SettingsDamaged && c.Device == device, "missing cloud.json: the journal's device ID is kept");
+                    c.Connect(server.Origin + "/connect#" + FakeServer.Token); c.Round(idle);
+                    Check(!c.Rebaselining && CloudClient.Map(server.App["playtime"]).Count == 1, "reconnecting keeps this account's journal and device");
+                }
+            });
+        }
+        // Journals written before device IDs were recorded carry neither deviceId nor account.
+        static void MakeLegacy(string data, bool forgetRemote)
+        {
+            string path = Path.Combine(data, "cloud-state.json"), text = File.ReadAllText(path);
+            text = Regex.Replace(text, "\"(deviceId|account)\":\"[^\"]*\"", "\"$1\":null");
+            if (forgetRemote) text = Regex.Replace(text, "\"remote\":\\{[^}]*\\}", "\"remote\":{}");
+            File.WriteAllText(path, text); File.WriteAllBytes(Path.Combine(data, "cloud.json"), new byte[300]);
+        }
+        internal static void LegacyJournalRecoversTheDeviceOnConnect()
+        {
+            InTemp(delegate(string root)
+            {
+                using (var server = new FakeServer())
+                using (var other = new FakeServer())
+                {
+                    string ar = Path.Combine(root, "A", "OnlineFix"), br = Path.Combine(root, "B", "OnlineFix"); DateTime date = DateTime.UtcNow.AddHours(-2);
+                    Seed(ar, "A", 100, null, date); Seed(br, "B", 200, null, date);
+                    long steamB = 7, importedB = 0; var receipts = new HashSet<string>(); int added = 0;
+                    Func<string, string, int, bool> ledger = delegate(string receipt, string app, int n) { if (receipts.Add(receipt)) { added += n; steamB += n; importedB += n; } return true; };
+                    Func<string, bool> idle = delegate { return false; }; var logs = new List<string>(); Action<string> log = logs.Add;
+                    var a = Client(Path.Combine(root, "A", "data"), ar, delegate { return 12; }, log);
+                    var b = Client(Path.Combine(root, "B", "data"), br, delegate { return steamB - importedB; }, log);
+                    a.Connect(server.Origin + "/connect#" + FakeServer.Token); b.Connect(server.Origin + "/connect#" + FakeServer.Token);
+                    a.Round(idle); b.Round(idle); b.Deliver(ledger, idle); string device = b.Device;
+                    MakeLegacy(b.Data, false);
+                    b = Client(b.Data, br, delegate { return steamB - importedB; }, log);
+                    Check(b.SettingsDamaged && b.Device != device, "legacy journal and damaged cloud.json: the device ID is unknown before connecting");
+                    b.Connect(server.Origin + "/connect#" + FakeServer.Token);
+                    Check(b.Device == device && logs.Any(l => l.Contains("device ID recovered")), "connect recovers the device ID: the one playtime device the journal never applied");
+                    Check(b.Rebaselining && Directory.GetFiles(b.Data, "cloud-account-unknown-*.json").Length == 1, "the ownerless journal is archived as unknown; the fresh journal rebaselines");
+                    b.Round(idle); b.Deliver(ledger, idle);
+                    Check(added == 12 && CloudClient.Map(server.App["playtime"]).Count == 2, "no minutes added twice and no second device for this PC");
+                    // Another account later: while an unknown archive exists, its fresh journal rebaselines too.
+                    b.Connect(other.Origin + "/connect#" + FakeServer.Token);
+                    Check(b.Rebaselining, "a fresh journal created while an unknown archive exists rebaselines");
+                    // Ambiguous: the journal never applied anyone, and two devices played: keep a new ID.
+                    MakeLegacy(a.Data, true); logs.Clear();
+                    a = Client(a.Data, ar, delegate { return 12; }, log); string fresh = a.Device; a.Connect(server.Origin + "/connect#" + FakeServer.Token);
+                    Check(a.Device == fresh && logs.Any(l => l.Contains("device ID not recovered")), "with several candidate devices the new ID is kept and logged");
+                }
+            });
+        }
+        internal static void JournalOfThePreviousAccountIsSwitchedOut()
+        {
+            InTemp(delegate(string root)
+            {
+                using (var server = new FakeServer())
+                {
+                    string data = Path.Combine(root, "data"), of = Path.Combine(root, "OnlineFix"); Func<string, bool> idle = delegate { return false; };
+                    Seed(of, "A", 100, null, DateTime.UtcNow.AddHours(-2));
+                    var c = Client(data, of, delegate { return 4; }, delegate { }); c.Connect(server.Origin + "/connect#" + FakeServer.Token); c.Round(idle);
+                    string key = CloudClient.Hash(Encoding.UTF8.GetBytes(server.Origin + ":test-user")), state = Path.Combine(data, "cloud-state.json"), text = File.ReadAllText(state);
+                    // A crash in the SaveJournal after switching to this account left the previous account's journal.
+                    File.WriteAllText(Path.Combine(data, "cloud-account-" + key + ".json"), text);
+                    File.WriteAllText(state, text.Replace(key, "previous0account"));
+                    c = Client(data, of, delegate { return 4; }, delegate { });
+                    Check(File.Exists(Path.Combine(data, "cloud-account-previous0account.json")) && File.ReadAllText(state).Contains(key) && !c.Rebaselining,
+                        "a journal of the previous account is archived under it and this account's journal is used");
+                }
+            });
+        }
+        internal static void LedgerResetAfterLaterImportsKeepsOwnMinutes()
+        {
+            InTemp(delegate(string root)
+            {
+                using (var server = new FakeServer())
+                {
+                    string ar = Path.Combine(root, "A", "OnlineFix"), br = Path.Combine(root, "B", "OnlineFix"); DateTime date = DateTime.UtcNow.AddHours(-2);
+                    Seed(ar, "A", 100, null, date); Seed(br, "B", 200, null, date);
+                    long minutesA = 12, steamB = 7, importedB = 0; var receipts = new HashSet<string>();
+                    Func<string, string, int, bool> ledger = delegate(string receipt, string app, int n) { if (receipts.Add(receipt)) { steamB += n; importedB += n; } return true; };
+                    Func<string, bool> idle = delegate { return false; }; Action<string> log = delegate { };
+                    var a = Client(Path.Combine(root, "A", "data"), ar, delegate { return minutesA; }, log);
+                    Func<CloudClient> makeB = delegate { var c = Client(Path.Combine(root, "B", "data"), br, delegate { return steamB - importedB; }, log); c.Imported = delegate { return importedB; }; return c; };
+                    var b = makeB(); a.Connect(server.Origin + "/connect#" + FakeServer.Token); b.Connect(server.Origin + "/connect#" + FakeServer.Token);
+                    a.Round(idle); b.Round(idle); b.Deliver(ledger, idle);
+                    importedB = 0; b.LedgerReset("reset-1"); b.Round(idle);            // ledger lost: 12 imported minutes untracked
+                    minutesA = 20; a.Round(idle); b.Round(idle); b.Deliver(ledger, idle); // 8 more imported, tracked by the new ledger
+                    steamB += 3; b.Round(idle);
+                    Check(CloudClient.Num(CloudClient.Map(server.App["playtime"])[b.Device]) == 10, "own minutes after a ledger reset and later imports");
+                    // The journal is lost later; the ledger keeps its old reset marker.
+                    File.WriteAllBytes(Path.Combine(b.Data, "cloud-state.json"), new byte[64]);
+                    b = makeB(); b.LedgerReset("reset-1"); b.Round(idle); b.Round(idle); steamB += 5; b.Round(idle);
+                    Check(CloudClient.Num(CloudClient.Map(server.App["playtime"])[b.Device]) == 15, "a later journal loss does not count the ledger's own imports twice: own minutes keep reaching the cloud");
+                }
+            });
+        }
+        internal static void LostPendingMinutesAreNotTakenAsImported()
+        {
+            InTemp(delegate(string root)
+            {
+                using (var server = new FakeServer())
+                {
+                    string ar = Path.Combine(root, "A", "OnlineFix"), br = Path.Combine(root, "B", "OnlineFix"); DateTime date = DateTime.UtcNow.AddHours(-2);
+                    Seed(ar, "A", 100, null, date); Seed(br, "B", 200, null, date);
+                    long steamB = 7; Func<string, bool> idle = delegate { return false; }; Action<string> log = delegate { };
+                    // The ledger accepts A's 12 minutes as pending, then is lost before Steam ever gets them.
+                    Func<string, string, int, bool> pendingOnly = delegate { return true; };
+                    var a = Client(Path.Combine(root, "A", "data"), ar, delegate { return 12; }, log);
+                    var b = Client(Path.Combine(root, "B", "data"), br, delegate { return steamB; }, log);
+                    a.Connect(server.Origin + "/connect#" + FakeServer.Token); b.Connect(server.Origin + "/connect#" + FakeServer.Token);
+                    a.Round(idle); b.Round(idle); b.Deliver(pendingOnly, idle);
+                    b.LedgerReset("reset-1"); b.Round(idle); steamB += 3; b.Round(idle);
+                    Check(CloudClient.Num(CloudClient.Map(server.App["playtime"])[b.Device]) == 10, "remote minutes a ledger reset lost before Steam got them are not counted as imported");
+                }
+            });
+        }
+        internal static void EmptyLedgerFileIsAnEmptyLedger()
+        {
+            InTemp(delegate(string dir)
+            {
+                string path = Path.Combine(dir, "playtime.txt"); File.WriteAllBytes(path, new byte[0]);
+                var ledger = new Playtime(path, delegate { });
+                Check(ledger.ResetMarker == null && !Names(dir).Any(n => n.Contains(".corrupt-")), "a 0-byte playtime.txt (older builds' empty ledger) is an empty ledger, not damage");
+                StateFile.Write(Path.Combine(dir, "presence.json"), "{}", false);
+                Check(File.ReadAllText(Path.Combine(dir, "presence.json")) == "{}" && Names(dir).Length == 2, "the unflushed atomic write for throwaway files leaves no temp file");
             });
         }
         internal static void DurableWritesLeaveNoTemporaryFiles()
@@ -618,7 +794,9 @@ namespace Cabinet
         }
     }
     // damaged: the saved connection was lost to a damaged file; cleared by the next connect.
-    sealed class CloudSettings { public string server, token, deviceId, deviceName, userName, userId; public bool damaged; }
+    // deviceUnconfirmed: cloud.json was lost and the journal predates recorded device IDs; the next connect
+    // looks this PC's device ID up on the server (FindDevice).
+    sealed class CloudSettings { public string server, token, deviceId, deviceName, userName, userId; public bool damaged, deviceUnconfirmed; }
     sealed class CloudAppJournal
     {
         // saveHash/saveUpdatedAt belong to the retired legacy save sync; kept so older Cabinet
@@ -632,8 +810,9 @@ namespace Cabinet
         // remote: per other device, the server total already applied here; pending: totals to apply.
         public Dictionary<string, long> remote = new Dictionary<string, long>();
         public Dictionary<string, long> pending = new Dictionary<string, long>();
-        // The next pull records the server's totals as already applied instead of adding them.
-        public bool rebaseline;
+        // rebaseline: the next pull records the server's totals as already applied instead of adding them.
+        // recountImported: importedBase is recomputed at the next push (after a ledger reset).
+        public bool rebaseline, recountImported;
     }
     sealed class CloudJournal
     {
@@ -660,6 +839,9 @@ namespace Cabinet
         internal string Device { get { return settings.deviceId; } }
         internal string UserId { get { return settings.userId; } }
         internal bool SettingsDamaged { get { return settings.damaged; } }
+        // Cloud minutes the playtime ledger counts as credited to Steam (Playtime.CloudMinutesInSteam), snapshotted
+        // by the host; used to tell which applied remote minutes a ledger reset left uncounted.
+        internal Func<string, long> Imported = delegate { return 0L; };
         internal bool Rebaselining { get { return journal.rebaseline || journal.apps.Values.Any(a => a.rebaseline); } }
         internal CloudClient(string data, string root, Func<string, long> getMinutes, Action<string> logger)
         {
@@ -676,14 +858,28 @@ namespace Cabinet
                 catch (CryptographicException) { settings.token = null; log("Stored token cannot be decrypted for this Windows user"); }
             }
             journal = LoadJournal(Path.Combine(Data, "cloud-state.json"), false);
-            if (stored == StateLoad.Damaged)
+            if (stored == StateLoad.Missing || stored == StateLoad.Damaged)
             {
-                // Keep this PC's device ID when the journal knows it: a new one would make the server
-                // count this PC's playtime twice.
+                // Keep this PC's device ID when the journal knows it: a new one would make the server count this
+                // PC's playtime twice. A journal from before IDs were recorded leaves it to the next connect.
                 if (!string.IsNullOrEmpty(journal.deviceId)) settings.deviceId = journal.deviceId;
-                log("Cabinet Cloud connection settings were lost; connect again");
+                else if (journal.apps.Count > 0) settings.deviceUnconfirmed = true;
+                if (stored == StateLoad.Damaged) log("Cabinet Cloud connection settings were lost; connect again");
+                Persist(SaveSettings);
             }
-            if (stored == StateLoad.Missing || stored == StateLoad.Damaged) Persist(SaveSettings);
+            else if (!string.IsNullOrEmpty(settings.userId) && !string.IsNullOrEmpty(journal.account) && journal.account != AccountKey(settings.server, settings.userId))
+            {
+                // A crash while switching accounts can leave the previous account's journal here: archive it under
+                // its account and use this account's.
+                try
+                {
+                    Atomic(AccountArchive(journal.account), Json.Serialize(journal));
+                    journal = LoadJournal(AccountArchive(AccountKey(settings.server, settings.userId)), UnknownArchives());
+                    log("journal belonged to the previous account; switched to this account's journal");
+                }
+                catch (Exception ex) { journal = new CloudJournal { rebaseline = true }; log("journal of the previous account not archived (" + ex.GetType().Name + "); this account's journal rebaselines"); }
+                Persist(SaveJournal);
+            }
             if (journal.rebaseline) Persist(SaveJournal);
             Saves = new SaveSync(Data, log, delegate { return SaveEnvironment.Current(Syncer.SteamPath(), Syncer.AccountId(), Root); });
         }
@@ -706,6 +902,36 @@ namespace Cabinet
         }
         static void Atomic(string path, string text) { StateFile.Write(path, text); }
         static string AccountKey(string server, string userId) { return Hash(Encoding.UTF8.GetBytes(server + ":" + userId)); }
+        string AccountArchive(string account) { return Path.Combine(Data, "cloud-account-" + account + ".json"); }
+        // Journals of an unknown account were archived: a fresh journal cannot tell what this PC applied.
+        bool UnknownArchives() { return Directory.GetFiles(Data, "cloud-account-unknown-*.json").Length > 0; }
+        // Journals written before device IDs were recorded: after cloud.json was lost, this PC's ID is taken
+        // from the account's state when exactly one device fits: a playtime device that the journal never
+        // applied as another PC, else a save/archive uploader named like this PC. Otherwise this PC stays new.
+        string FindDevice(CloudJournal known)
+        {
+            try
+            {
+                var others = new HashSet<string>(known.apps.Values.SelectMany(a => a.remote.Keys.Concat(a.pending.Keys)));
+                var played = new HashSet<string>(); var named = new HashSet<string>();
+                foreach (var app in Map(Map(RequestJson("GET", "/api/state", null))["apps"]))
+                {
+                    var state = Map(app.Value); object value;
+                    if (state.TryGetValue("playtime", out value)) foreach (string id in Map(value).Keys) if (!others.Contains(id)) played.Add(id);
+                    foreach (string key in new[] { "save", "archive" })
+                    {
+                        if (!state.TryGetValue(key, out value)) continue;
+                        var meta = Map(value); object id, name;
+                        if (meta.TryGetValue("deviceId", out id) && meta.TryGetValue("deviceName", out name) && Convert.ToString(name) == settings.deviceName && !others.Contains(Convert.ToString(id)))
+                            named.Add(Convert.ToString(id));
+                    }
+                }
+                string found = played.Count == 1 ? played.Single() : named.Count == 1 ? named.Single() : null;
+                log(found != null ? "device ID recovered from the account's state" : "device ID not recovered (" + played.Count + " playtime, " + named.Count + " name candidates); this PC is a new device");
+                return found;
+            }
+            catch (Exception ex) { log("device ID not recovered: " + ex.GetType().Name); return null; }
+        }
         string savedJournal;
         void SaveJournal()
         {
@@ -747,16 +973,19 @@ namespace Cabinet
                 var me = Map(Map(RequestJson("GET", "/api/me", null))["user"]);
                 settings.userName = Convert.ToString(me["name"]); settings.userId = Convert.ToString(me["id"]);
                 string account = AccountKey(server, settings.userId);
-                // After a damaged cloud.json, the journal on disk may still be this account's: keep it.
-                if ((previous.server != server || previous.userId != settings.userId) && !(previous.damaged && journal.account == account))
+                if (previous.deviceUnconfirmed) settings.deviceId = FindDevice(journal) ?? settings.deviceId;
+                // With cloud.json lost, the journal on disk may still be this account's: keep it.
+                if ((previous.server != server || previous.userId != settings.userId) && !(string.IsNullOrEmpty(previous.userId) && journal.account == account))
                 {
                     // Account-specific remote watermarks must not suppress another account's
                     // progress, or relabel old pending receipts as belonging to the new user.
                     string owner = !string.IsNullOrEmpty(previous.userId) ? AccountKey(previous.server, previous.userId) : journal.account;
-                    if (owner != null) Atomic(Path.Combine(Data, "cloud-account-" + owner + ".json"), Json.Serialize(journal));
-                    // Without a known owner, the old journal may have been this account's: what this PC
-                    // already applied is unknown, so a fresh journal rebaselines.
-                    journal = LoadJournal(Path.Combine(Data, "cloud-account-" + account + ".json"), previous.damaged && owner == null);
+                    if (owner != null) Atomic(AccountArchive(owner), Json.Serialize(journal));
+                    // A journal without an owner may have been any account's, this one included: it is kept as an
+                    // unknown archive, and while one exists a fresh journal rebaselines.
+                    else if (journal.apps.Count > 0) Atomic(Path.Combine(Data, "cloud-account-unknown-" + DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture) + ".json"), Json.Serialize(journal));
+                    bool unknown = owner == null && (journal.apps.Count > 0 || journal.rebaseline || previous.damaged);
+                    journal = LoadJournal(AccountArchive(account), unknown || UnknownArchives());
                 }
                 SaveSettings(); SaveJournal();
             }
@@ -881,7 +1110,7 @@ namespace Cabinet
         internal void LedgerReset(string marker)
         {
             if (string.IsNullOrEmpty(marker) || marker == journal.ledgerReset) return;
-            foreach (var a in journal.apps.Values) a.importedBase = Math.Max(a.importedBase, a.remote.Values.Sum());
+            foreach (var a in journal.apps.Values) a.recountImported = true;
             // Apps still waiting for a baseline get theirs from the server's totals.
             if (journal.rebaseline || journal.apps.Values.Any(a => a.rebaseline)) journal.importsUnknown = true;
             journal.ledgerReset = marker; SaveJournal();
@@ -942,7 +1171,15 @@ namespace Cabinet
                 a.statsUpdatedAt = File.Exists(path) ? (long)(File.GetLastWriteTimeUtc(path) - new DateTime(1970, 1, 1)).TotalMilliseconds : 0;
             }
             // Own minutes wait for an app's baseline when Steam's imported minutes are unknown.
-            if (!(journal.importsUnknown && (journal.rebaseline || a.rebaseline))) a.ownMinutes = Math.Max(a.ownMinutes, minutes(id) - a.importedBase);
+            if (!(journal.importsUnknown && (journal.rebaseline || a.rebaseline)))
+            {
+                long own = minutes(id);
+                // After a ledger reset: the remote minutes this journal applied that the ledger no longer counts
+                // (Imported), but never more than Steam's playtime beyond this PC's pushed own minutes, so remote
+                // minutes a reset lost before they reached Steam are not taken as imported.
+                if (a.recountImported && own > 0) { a.importedBase = Math.Max(0, Math.Min(a.remote.Values.Sum() - Imported(id), own - a.ownMinutes)); a.recountImported = false; }
+                a.ownMinutes = Math.Max(a.ownMinutes, own - a.importedBase);
+            }
             var body = new Dictionary<string, object> { { "deviceId", Device }, { "deviceName", settings.deviceName }, { "achievements", ach }, { "stats", stats }, { "statsUpdatedAt", a.statsUpdatedAt }, { "playtimeMinutes", a.ownMinutes } };
             string progress = Hash(Encoding.UTF8.GetBytes(Json.Serialize(body))); if (blocked(id)) return;
             if (progress != a.progressHash) { RequestJson("POST", "/api/apps/" + id + "/progress", body); a.progressHash = progress; SaveJournal(); }
@@ -968,7 +1205,9 @@ namespace Cabinet
             }
             foreach (var time in Map(state["playtime"]))
             {
-                if (time.Key == Device) continue; long previous; a.remote.TryGetValue(time.Key, out previous); long total = Num(time.Value);
+                long previous; a.remote.TryGetValue(time.Key, out previous); long total = Num(time.Value);
+                // A reset journal takes this PC's own total back from the server, which keeps the maximum anyway.
+                if (time.Key == Device) { if (a.rebaseline) a.ownMinutes = Math.Max(a.ownMinutes, total); continue; }
                 // A new baseline records the totals already on the server as applied here: never add them twice.
                 if (a.rebaseline) { if (total > previous) a.remote[time.Key] = total; a.pending.Remove(time.Key); }
                 else if (total > previous) a.pending[time.Key] = total;
@@ -976,7 +1215,7 @@ namespace Cabinet
             if (a.rebaseline)
             {
                 // With the playtime ledger reset too, Steam already holds these minutes, uncounted.
-                if (journal.importsUnknown) a.importedBase = Math.Max(a.importedBase, a.remote.Values.Sum());
+                if (journal.importsUnknown) a.recountImported = true;
                 a.rebaseline = false;
             }
             SaveJournal();

@@ -1156,7 +1156,8 @@ namespace Cabinet
         }
         void Save()
         {
-            StateFile.Write(ledger, string.Concat(intervals.Select(s => string.Join("\t", s.Account, s.App, s.Start, s.End) + Environment.NewLine)));
+            // Rewritten every tick while playing; losing it only skips refiling media, so it is not flushed.
+            StateFile.Write(ledger, string.Concat(intervals.Select(s => string.Join("\t", s.Account, s.App, s.Start, s.End) + Environment.NewLine)), false);
         }
         internal string Assign(string account, long start, long end)
         {
@@ -1707,8 +1708,9 @@ namespace Cabinet
         }
         static Ledger ParseLedger(string text)
         {
-            if (!text.EndsWith("\n")) return null; // every save ends with a newline: this one was cut short
             var ledger = new Ledger();
+            if (text.Length == 0) return ledger; // older builds wrote an empty ledger as an empty file
+            if (!text.EndsWith("\n")) return null; // every save ends with a newline: this one was cut short
             foreach (var l in text.Split('\n'))
             {
                 var p = l.TrimEnd('\r').Split('|');
@@ -2341,8 +2343,8 @@ namespace Cabinet
                 while (ParentAlive(parent, started) && Playtime.SteamRunning() && !stop.WaitOne(0))
                 {
                     session.Pump();
-                    StateFile.WriteFlushed(args[4] + ".tmp", session.PresenceSnapshot(), new UTF8Encoding(false));
-                    StateFile.Commit(args[4] + ".tmp", args[4]);
+                    File.WriteAllText(args[4] + ".tmp", session.PresenceSnapshot(), new UTF8Encoding(false));
+                    StateFile.Commit(args[4] + ".tmp", args[4]); // throwaway, rewritten every second: atomic, not flushed
                     stop.WaitOne(1000);
                 }
             }

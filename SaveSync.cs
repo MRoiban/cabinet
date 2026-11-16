@@ -138,10 +138,11 @@ namespace Cabinet
             Manifest = new SaveManifestCache(Data, log);
             Overrides = new SaveOverrides(Data, log);
             statePath = Path.Combine(Data, "save-state.json");
-            // Recovered from an interrupted write's leftover, else moved aside. A fresh save journal is safe:
-            // without J, differing local and cloud saves are a conflict for the user, never an overwrite.
+            // Recovered from an interrupted write's leftover, else moved aside at once (no file means the same as a
+            // fresh journal). A fresh save journal is safe: without J, differing local and cloud saves are a
+            // conflict for the user, never an overwrite.
             StateLoad loaded;
-            state = StateFile.Load(statePath, delegate(string text) { return Json.Deserialize<SaveStateFile>(text); }, log, out loaded) ?? new SaveStateFile();
+            state = StateFile.Load(statePath, delegate(string text) { return Json.Deserialize<SaveStateFile>(text); }, log, out loaded, OnDamage.MoveAside) ?? new SaveStateFile();
             if (state.accounts == null) state.accounts = new Dictionary<string, Dictionary<string, SaveAppState>>();
         }
         // Journal entries are per Cabinet account so another account's state never suppresses sync.

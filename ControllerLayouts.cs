@@ -61,7 +61,7 @@ namespace Cabinet
             if (!live && running.Count == 0 && (closed || DateTime.UtcNow >= retry) && File.Exists(lastPath))
             {
                 retry = DateTime.UtcNow.AddMinutes(1);
-                StateLoad loaded; var last = StateFile.Load(lastPath, delegate(string text) { return json.Deserialize<LastGame>(text); }, log, out loaded);
+                StateLoad loaded; var last = StateFile.Load(lastPath, delegate(string text) { return json.Deserialize<LastGame>(text); }, log, out loaded, OnDamage.MoveAside);
                 if (last != null && last.Account == account) Apply(last.App, account);
             }
             return null;
